@@ -1,4 +1,4 @@
-# minimize_rules — Hashcat Rule Minimizer
+# minimizer — Hashcat Rule Minimizer
 
 A standalone Python tool that eliminates functionally redundant rules from hashcat rule files. Two rules are considered equivalent if they produce **identical output on every word in the probe set** — if they can't be told apart, one of them is waste.
 
