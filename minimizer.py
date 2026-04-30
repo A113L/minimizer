@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-minimize_rules.py — Standalone Hashcat Rule Minimizer
+minimizer.py — Standalone Hashcat Rule Minimizer
 ======================================================
 Reads a hashcat rule file and eliminates functionally redundant rules by
 computing each rule's *signature* — the tuple of outputs produced when the
@@ -14,36 +14,80 @@ ranking) and the later duplicate is discarded.
 Usage
 -----
     # Basic — uses only the built-in probe set (30 words)
-    python minimize_rules.py ruleset.rule -o minimized.rule
+    python minimizer.py ruleset.rule -o minimized.rule
 
     # Add extra probe words on the CLI
-    python minimize_rules.py ruleset.rule -o minimized.rule \\
+    python minimizer.py ruleset.rule -o minimized.rule \\
         --extra-probes password admin letmein root test
 
     # Draw additional probes from a wordlist
-    python minimize_rules.py ruleset.rule -o minimized.rule \\
+    python minimizer.py ruleset.rule -o minimized.rule \\
         --probe-file rockyou.txt --probe-words 100
 
     # Combine all three sources
-    python minimize_rules.py ruleset.rule -o minimized.rule \\
+    python minimizer.py ruleset.rule -o minimized.rule \\
         --extra-probes password admin \\
         --probe-file rockyou.txt --probe-words 80
 """
 
 import argparse
 import datetime
+import multiprocessing
 import os
 import pickle
 import random
 import sqlite3
 import sys
-from typing import List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Optional, Tuple, Union
 
 try:
     from tqdm import tqdm
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+
+
+# ====================================================================
+# --- INVALID UTF-8 BYTE WRAPPER ---
+# ====================================================================
+
+class InvalidUTF8Bytes:
+    """
+    Wrapper dla ciągu bajtów który NIE jest poprawnym UTF-8.
+
+    Powstaje gdy reguła strukturalna (r, d, {, }, q, …) rozerwie
+    wielobajtowy znak UTF-8 na granicy bajtów w trybie ``--multibyte``.
+
+    Zamiast cichego fallbacku do latin-1 (który zwraca zwykły ``str``
+    nie do odróżnienia od poprawnego tekstu), ten typ jawnie sygnalizuje
+    że dane są "uszkodzone" bajtowo.
+
+    Właściwości:
+      • haszowany i porównywalny po surowych bajtach
+        → nadaje się jako element sygnatury w ``dict``/``set``/``pickle``
+      • ``repr`` jawnie sygnalizuje niepoprawny UTF-8
+      • ``.raw`` : ``bytes`` — oryginalne bajty bez konwersji
+    """
+
+    __slots__ = ('raw',)
+
+    def __init__(self, data: bytes) -> None:
+        self.raw: bytes = data
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, InvalidUTF8Bytes):
+            return self.raw == other.raw
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.raw)
+
+    def __repr__(self) -> str:
+        return f"<InvalidUTF8 {self.raw.hex(' ')!r}>"
+
+    def __reduce__(self):
+        return (self.__class__, (self.raw,))
 
 
 # ====================================================================
@@ -96,12 +140,16 @@ def debug_rule(rule: str, probe: List[str]) -> None:
     print(f"\n{bold(cyan('Rule trace:'))} {bold(repr(rule))}\n")
     atoms = tokenize_rule(rule)
     print(f"  Atoms : {atoms}\n")
-    any_unsupported = False
+    any_unsupported  = False
+    any_invalid_utf8 = False
     for word in probe:
         result = apply_chain(rule, word)
         if result is None:
             tag = yellow("→  <unsupported>")
             any_unsupported = True
+        elif isinstance(result, InvalidUTF8Bytes):
+            tag = yellow(f"→  <invalid UTF-8: {result.raw.hex(' ')}>")
+            any_invalid_utf8 = True
         elif result == word:
             tag = dim(f"→  {result!r}  (no change)")
         else:
@@ -109,6 +157,14 @@ def debug_rule(rule: str, probe: List[str]) -> None:
         print(f"  {dim(repr(word)):32s}  {tag}")
     if any_unsupported:
         print(f"\n  {yellow('Warning:')} rule contains unsupported opcode(s).")
+    if any_invalid_utf8:
+        print(
+            f"\n  {yellow('Note:')} rule produced invalid UTF-8 byte sequences "
+            f"on some probe words.\n"
+            f"  This happens when a structural rule (r, d, {{, }}, q, …) splits\n"
+            f"  a multibyte code-point across a byte boundary.  hashcat will\n"
+            f"  process the raw bytes — the rule is still valid and kept."
+        )
     print()
 
 
@@ -142,7 +198,7 @@ BUILTIN_PROBES: List[str] = [
     # ── typical password base words (len 7–9) ────────────────────────
     "letmein",          # len 7
     "welcome",          # len 7
-    "password",         # len 8  ← THE critical one missing in rulest_v2
+    "password",         # len 8
     "sunshine",         # len 8
     "football",         # len 8
     "baseball",         # len 8
@@ -226,9 +282,13 @@ def _arg_ord(token: str, pos: int) -> int:
     return ord(token[pos]) if pos < len(token) else 0
 
 
-def _encode_word(word: str, multibyte: bool) -> List[int]:
+def _encode_word(word: Union[str, "InvalidUTF8Bytes"], multibyte: bool) -> List[int]:
     """
     Encode *word* into a list of byte integers for rule processing.
+
+    When *word* is an ``InvalidUTF8Bytes`` instance (produced by a previous
+    rule in the chain that split a multibyte code-point) we reuse its raw
+    bytes directly — there is no meaningful re-encoding to do.
 
     When *multibyte* is False (default / hashcat-compatible mode) the word is
     encoded as latin-1.  Characters outside the latin-1 range raise
@@ -238,43 +298,62 @@ def _encode_word(word: str, multibyte: bool) -> List[int]:
     character is accepted.  Rules then operate on the raw UTF-8 byte sequence,
     exactly as hashcat does on a UTF-8 wordlist.
     """
+    if isinstance(word, InvalidUTF8Bytes):
+        # Already raw bytes from a previous rule in the chain — use as-is.
+        return list(word.raw)
     enc = 'utf-8' if multibyte else 'latin-1'
     return list(word.encode(enc))
 
 
-def _decode_bytes(byte_list: List[int], multibyte: bool) -> Optional[str]:
+def _decode_bytes(
+    byte_list: List[int],
+    multibyte: bool,
+) -> Union[str, InvalidUTF8Bytes]:
     """
-    Decode a list of byte integers back to a Python string.
+    Decode a list of byte integers back to a Python string (or an
+    ``InvalidUTF8Bytes`` wrapper when the bytes are not valid UTF-8).
 
-    In multibyte mode UTF-8 is tried first.  If the byte sequence is not valid
-    UTF-8 (which happens when structural rules like ``r``, ``d``, ``{``, etc.
-    split a multibyte code-point across the boundary), we fall back to latin-1
-    rather than returning ``None``.
+    Non-multibyte mode
+    ------------------
+    Latin-1 is bijective over 0x00–0xFF and never raises — every byte
+    becomes the Unicode code-point of the same value.
 
-    Returning ``None`` here would cause ``compute_signature`` to emit the global
-    ``_UNSUPPORTED_SIG`` sentinel for every such rule, making all structurally
-    different rules that happen to produce invalid UTF-8 look identical — and
-    thus falsely removing them as duplicates.
+    Multibyte mode
+    --------------
+    UTF-8 is tried first.  If the byte sequence is invalid (happens when
+    structural rules like ``r``, ``d``, ``{``, ``}``, ``q``, … split a
+    multibyte code-point across a byte boundary) we return
+    ``InvalidUTF8Bytes(raw)`` instead of silently falling back to latin-1.
 
-    By falling back to latin-1 (which succeeds for any byte sequence) each rule
-    retains its own unique signature based on the actual byte-level output.
+    Why not return ``None``?
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    ``None`` would cause ``compute_signature`` to emit the global
+    ``_UNSUPPORTED_SIG`` sentinel, making *all* rules that produce invalid
+    UTF-8 look identical and collapsing them into false duplicates.
+    ``InvalidUTF8Bytes`` is hashed and compared by its raw bytes, so each
+    rule retains a unique signature — while callers can still detect the
+    invalid-UTF-8 case via ``isinstance(result, InvalidUTF8Bytes)``.
     """
+    raw = bytes(byte_list)
+
     if not multibyte:
-        try:
-            return bytes(byte_list).decode('latin-1')
-        except Exception:
-            return None
-    # multibyte: try UTF-8 first, fall back to latin-1 on invalid sequences
+        return raw.decode('latin-1')
+
     try:
-        return bytes(byte_list).decode('utf-8')
+        return raw.decode('utf-8')
     except (UnicodeDecodeError, ValueError):
-        # Structural rule split a multibyte code-point — preserve raw bytes as
-        # a latin-1 string so the signature still distinguishes different rules.
-        return bytes(byte_list).decode('latin-1')
+        return InvalidUTF8Bytes(raw)
 
 
-def _apply_single(rule: str, word: str, multibyte: bool = False) -> Optional[str]:
-    """Apply one hashcat rule atom to *word*.  Returns None on unsupported opcode.
+def _apply_single(
+    rule: str,
+    word: str,
+    multibyte: bool = False,
+) -> Union[str, InvalidUTF8Bytes, None]:
+    """Apply one hashcat rule atom to *word*.
+
+    Returns ``None`` on unsupported opcode, ``InvalidUTF8Bytes`` when a
+    structural rule splits a multibyte code-point (multibyte mode only).
 
     Parameters
     ----------
@@ -555,7 +634,11 @@ def tokenize_rule(chain: str) -> List[str]:
     return tokens
 
 
-def apply_chain(chain: str, word: str, multibyte: bool = False) -> Optional[str]:
+def apply_chain(
+    chain: str,
+    word: str,
+    multibyte: bool = False,
+) -> Union[str, InvalidUTF8Bytes, None]:
     """
     Apply a hashcat rule chain to *word*.
 
@@ -573,9 +656,16 @@ def apply_chain(chain: str, word: str, multibyte: bool = False) -> Optional[str]
         When ``True`` the word is processed as UTF-8 bytes, enabling support
         for multibyte Unicode characters (Polish, German, CJK, emoji, …).
 
-    Returns ``None`` if any atom contains an unsupported opcode.
+    Returns
+    -------
+    str
+        Normal transformed word.
+    InvalidUTF8Bytes
+        Multibyte mode only: the rule produced an invalid UTF-8 byte sequence.
+    None
+        Any atom contained an unsupported opcode.
     """
-    cur: Optional[str] = word
+    cur: Union[str, InvalidUTF8Bytes, None] = word
     for atom in tokenize_rule(chain):
         cur = _apply_single(atom, cur, multibyte=multibyte)  # type: ignore[arg-type]
         if cur is None:
@@ -717,43 +807,72 @@ def read_rules(path: str) -> List[str]:
 
 
 # ====================================================================
+# --- MULTIPROCESSING WORKER ---
+# ====================================================================
+
+def _sig_worker(args: tuple) -> List[tuple]:
+    """
+    Top-level worker function for multiprocessing.
+
+    Must be defined at module level (not a closure) so that
+    ``ProcessPoolExecutor`` can pickle it on all platforms (including
+    Windows / macOS which use the *spawn* start method).
+
+    Parameters
+    ----------
+    args : (rules_slice, probe, multibyte)
+        rules_slice : list of str  — the chunk of rules to process
+        probe       : list of str  — probe word set
+        multibyte   : bool
+
+    Returns
+    -------
+    list of (rule: str, sig_blob: bytes)
+        ``sig_blob`` is ``pickle.dumps(signature, protocol=4)``.
+        Returning bytes instead of the raw tuple avoids re-pickling
+        complex ``InvalidUTF8Bytes`` objects across the IPC boundary a
+        second time — each worker serialises once, the main process
+        uses the blob directly as a dict key.
+    """
+    rules_slice, probe, multibyte = args
+    out = []
+    for rule in rules_slice:
+        sig      = compute_signature(rule, probe, multibyte=multibyte)
+        sig_blob = pickle.dumps(sig, protocol=4)
+        out.append((rule, sig_blob))
+    return out
+
+
+# ====================================================================
 # --- CORE MINIMIZER ---
 # ====================================================================
 
-# Rulesets larger than this use a SQLite temp-DB instead of an in-memory
-# dict so that the signature map never blows up RAM.
-_SQLITE_THRESHOLD = 1_000_000
 
-
-def _minimize_rules_sqlite(
+def _minimizer_sqlite(
     rules: List[str],
     probe: List[str],
     multibyte: bool = False,
+    workers: int = 1,
 ) -> "tuple[List[str], int, int]":
     """
-    SQLite-backed deduplication for large rulesets (> _SQLITE_THRESHOLD rules).
+    SQLite-backed deduplication — used for all rulesets regardless of size.
 
     The signature map lives entirely inside a temporary ``minimizer_tmp_<pid>.db``
     file in the current working directory, which is deleted unconditionally on
     completion (success or error).  Only the ``kept`` list (unique rules) is
-    held in Python memory, which is far smaller than storing every signature.
+    held in Python memory.
 
-    Commit batching (every 10 000 rows) keeps SQLite write throughput high
-    while avoiding one transaction per rule.
+    When *workers* > 1 the signature-computation phase is parallelised across
+    a ``ProcessPoolExecutor``.  The deduplication INSERT loop always runs on
+    the main process (SQLite connections are not fork-safe).
     """
     db_path = os.path.join(os.getcwd(), f"minimizer_tmp_{os.getpid()}.db")
-    # Remove any stale temp file from a previous crashed run
     if os.path.exists(db_path):
         os.remove(db_path)
-
-    print(f"  {cyan('[DB]')}  Ruleset exceeds {_SQLITE_THRESHOLD:,} rules — "
-          f"using SQLite backing store\n"
-          f"       {dim(db_path)}")
 
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
-        # Performance pragmas: WAL mode + no fsync (temp file, loss is fine)
         cur.executescript("""
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous  = OFF;
@@ -767,11 +886,17 @@ def _minimize_rules_sqlite(
         n_removed       = 0
         _BATCH          = 10_000
 
-        # ── progress bar (same pattern as the in-memory path) ────────
+        # ── parallel signature computation ────────────────────────────
+        pairs: List[tuple] = _compute_sigs_parallel(rules, probe, multibyte, workers)
+
+        # ── serial deduplication INSERT ───────────────────────────────
+        _BATCH    = 10_000
+        _interval = max(1, len(pairs) // 100)   # ~100 updates regardless of size
+
         if HAS_TQDM:
             iterator = tqdm(
-                rules,
-                desc=green("  Minimizing"),
+                pairs,
+                desc=green("  Deduplicating"),
                 unit="rule",
                 ncols=88,
                 bar_format=(
@@ -782,37 +907,28 @@ def _minimize_rules_sqlite(
             set_postfix = iterator.set_postfix
         else:
             _counter = [0]
-
-            def _noop_postfix(**_kw):
-                pass
-
-            def _simple_iter(rules):
-                for r in rules:
+            def _noop_postfix(**_kw): pass
+            def _simple_iter(pairs):
+                total = len(pairs)
+                for p in pairs:
                     _counter[0] += 1
-                    if _counter[0] % _BATCH == 0:
-                        pct = _counter[0] / len(rules) * 100 if rules else 0
+                    if _counter[0] % _interval == 0 or _counter[0] == total:
+                        pct = _counter[0] / total * 100
                         print(
-                            f"  {_counter[0]:,}/{len(rules):,}  ({pct:.0f}%)  "
+                            f"  dedup  {_counter[0]:,}/{total:,}  ({pct:.0f}%)  "
                             f"kept={len(kept):,}",
                             end="\r", flush=True,
                         )
-                    yield r
-
-            iterator    = _simple_iter(rules)
+                    yield p
+            iterator    = _simple_iter(pairs)
             set_postfix = _noop_postfix
 
         pending = 0
         conn.execute("BEGIN")
 
-        for rule in iterator:
-            sig      = compute_signature(rule, probe, multibyte=multibyte)
-            sig_blob = pickle.dumps(sig, protocol=4)
-
-            cur.execute(
-                "INSERT OR IGNORE INTO sigs (sig) VALUES (?)",
-                (sig_blob,),
-            )
-            if cur.rowcount:          # 1 = newly inserted → unique rule
+        for rule, sig_blob in iterator:
+            cur.execute("INSERT OR IGNORE INTO sigs (sig) VALUES (?)", (sig_blob,))
+            if cur.rowcount:
                 kept.append(rule)
                 dbg(f"KEPT  [{len(kept):>6,}]  {rule!r}", level="RULE")
                 if HAS_TQDM:
@@ -830,7 +946,7 @@ def _minimize_rules_sqlite(
         conn.commit()
 
         if not HAS_TQDM:
-            print()   # newline after \r progress line
+            print()
 
     finally:
         conn.close()
@@ -841,13 +957,130 @@ def _minimize_rules_sqlite(
     return kept, len(kept), n_removed
 
 
-def minimize_rules(
+def _compute_sigs_parallel(
+    rules: List[str],
+    probe: List[str],
+    multibyte: bool,
+    workers: int,
+) -> List[tuple]:
+    """
+    Compute ``(rule, sig_blob)`` pairs for every rule in *rules*.
+
+    When *workers* == 1 the computation runs in the calling process.
+    Otherwise a ``ProcessPoolExecutor`` distributes chunks across *workers* processes.
+
+    The returned list preserves the original rule order so that the
+    deduplication loop can safely keep the *first* occurrence.
+
+    Chunk sizing
+    ------------
+    ``chunk_size = max(500, len(rules) // (workers * 4))``
+
+    Using 4× more chunks than workers gives the pool scheduler room to
+    balance uneven loads (some rules are slower than others) without the
+    per-chunk IPC overhead becoming significant.
+    """
+    use_mp = workers > 1
+
+    if not use_mp:
+        # Single-process path — progress bar on the computation (this is the slow part)
+        result   = []
+        total    = len(rules)
+        interval = max(1, total // 100)   # ~100 updates regardless of ruleset size
+
+        if HAS_TQDM:
+            iterator = tqdm(
+                rules,
+                desc=green("  Computing"),
+                unit="rule",
+                ncols=88,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            )
+        else:
+            _counter = [0]
+            def _simple_iter(rules):
+                for r in rules:
+                    _counter[0] += 1
+                    n = _counter[0]
+                    if n % interval == 0 or n == total:
+                        pct = n / total * 100
+                        print(f"  compute  {n:,}/{total:,}  ({pct:.0f}%)",
+                              end='\r', flush=True)
+                    yield r
+            iterator = _simple_iter(rules)
+
+        for rule in iterator:
+            sig      = compute_signature(rule, probe, multibyte=multibyte)
+            sig_blob = pickle.dumps(sig, protocol=4)
+            result.append((rule, sig_blob))
+
+        if not HAS_TQDM:
+            print()   # newline after \r
+        return result
+
+    # ── parallel path ─────────────────────────────────────────────────
+    chunk_size = max(500, len(rules) // (workers * 4))
+    chunks     = [rules[i:i + chunk_size] for i in range(0, len(rules), chunk_size)]
+    work_items = [(chunk, probe, multibyte) for chunk in chunks]
+
+    print(f"  {cyan('[MP]')}  Parallel signature computation: "
+          f"{bold(str(workers))} workers, "
+          f"{bold(str(len(chunks)))} chunks "
+          f"(~{chunk_size:,} rules each)")
+
+    # Collect futures in submission order so we can reconstruct the
+    # original rule sequence after all workers finish.
+    ordered_results: List[List[tuple]] = [None] * len(chunks)  # type: ignore
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        future_to_idx = {
+            pool.submit(_sig_worker, item): idx
+            for idx, item in enumerate(work_items)
+        }
+
+        if HAS_TQDM:
+            pbar = tqdm(
+                as_completed(future_to_idx),
+                total=len(chunks),
+                desc=green("  Computing"),
+                unit="chunk",
+                ncols=88,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            )
+            completed_iter = pbar
+        else:
+            _done = [0]
+            def _plain_iter(it, total_chunks):
+                for f in it:
+                    _done[0] += 1
+                    print(f"  compute  chunk {_done[0]}/{total_chunks}",
+                          end='\r', flush=True)
+                    yield f
+            completed_iter = _plain_iter(as_completed(future_to_idx), len(chunks))
+
+        for future in completed_iter:
+            idx = future_to_idx[future]
+            ordered_results[idx] = future.result()
+
+    # Flatten while preserving original order
+    flat: List[tuple] = []
+    for batch in ordered_results:
+        flat.extend(batch)
+    return flat
+
+
+def minimizer(
     rules: List[str],
     probe: List[str],
     multibyte: bool = False,
+    workers: int = 1,
 ) -> Tuple[List[str], int, int]:
     """
     Deduplicate *rules* by functional signature over *probe*.
+
+    Always uses a temporary SQLite database for the deduplication index,
+    regardless of ruleset size.  This keeps memory usage flat and avoids
+    the complexity of two separate code paths.
 
     When two rules share the same signature the one appearing *earlier*
     in *rules* is kept (file order = priority).
@@ -861,6 +1094,9 @@ def minimize_rules(
     multibyte : bool
         When ``True`` words are processed as UTF-8 bytes so that rules on
         non-ASCII (Polish, German, CJK, …) passwords are handled correctly.
+    workers : int
+        Number of worker processes for parallel signature computation.
+        ``1`` disables multiprocessing entirely (default).
 
     Returns
     -------
@@ -871,56 +1107,7 @@ def minimize_rules(
     n_removed : int
         Number of rules eliminated.
     """
-    # ── delegate to SQLite path for large rulesets ───────────────────
-    if len(rules) > _SQLITE_THRESHOLD:
-        return _minimize_rules_sqlite(rules, probe, multibyte=multibyte)
-
-    sig_map: dict       = {}   # signature -> rule (first seen)
-    kept:    List[str]  = []
-    n_removed           = 0
-
-    # ── progress bar (gracefully falls back to a plain counter) ──────
-    if HAS_TQDM:
-        iterator = tqdm(
-            rules,
-            desc=green("  Minimizing"),
-            unit="rule",
-            ncols=88,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-        )
-        set_postfix = iterator.set_postfix
-    else:
-        # simple fallback: print progress every 10 000 rules
-        _counter = [0]
-        def _noop_postfix(**_kw): pass
-        def _simple_iter(rules):
-            for r in rules:
-                _counter[0] += 1
-                if _counter[0] % 10_000 == 0:
-                    pct = _counter[0] / len(rules) * 100 if rules else 0
-                    print(f"  {_counter[0]:,}/{len(rules):,}  ({pct:.0f}%)  "
-                          f"kept={len(kept):,}", end='\r', flush=True)
-                yield r
-        iterator     = _simple_iter(rules)
-        set_postfix  = _noop_postfix
-
-    for rule in iterator:
-        sig = compute_signature(rule, probe, multibyte=multibyte)
-        if sig not in sig_map:
-            sig_map[sig] = rule
-            kept.append(rule)
-            dbg(f"KEPT  [{len(kept):>6,}]  {rule!r}", level="RULE")
-            if HAS_TQDM:
-                set_postfix({"unique": cyan(str(len(kept)))}, refresh=False)
-        else:
-            dup_of = sig_map[sig]
-            n_removed += 1
-            dbg(f"DROP  {rule!r}  ≡  {dup_of!r}", level="DUP")
-
-    if not HAS_TQDM:
-        print()   # newline after \r progress
-
-    return kept, len(kept), n_removed
+    return _minimizer_sqlite(rules, probe, multibyte=multibyte, workers=workers)
 
 
 # ====================================================================
@@ -928,7 +1115,7 @@ def minimize_rules(
 # ====================================================================
 def main() -> None:
     ap = argparse.ArgumentParser(
-        prog='minimize_rules',
+        prog='minimizer',
         description=(
             'Standalone Hashcat Rule Minimizer\n\n'
             'Eliminates functionally redundant rules by computing each rule\'s\n'
@@ -970,6 +1157,19 @@ def main() -> None:
                           'German, French, Russian, CJK, and other non-ASCII '
                           'characters.  Also adds extra multibyte probe words '
                           '(see --list-probes).'))
+
+    # ── performance options ───────────────────────────────────────────
+    grp4 = ap.add_argument_group('Performance options')
+    grp4.add_argument(
+        '--workers', type=int,
+        default=1,
+        metavar='N',
+        help=(
+            'Number of worker processes for parallel signature computation.  '
+            f'Use --workers 0 to auto-detect (os.cpu_count() = {os.cpu_count()}).  '
+            'Default: 1 (single-process).'
+        ),
+    )
 
     # ── debug options ─────────────────────────────────────────────────
     grp3 = ap.add_argument_group('Debug options')
@@ -1058,9 +1258,15 @@ def main() -> None:
         args.output = f"{base}.minimized{ext or '.rule'}"
 
     # ── banner ────────────────────────────────────────────────────────
-    print(f"\n{bold(cyan('minimize_rules'))}  —  Standalone Hashcat Rule Minimizer\n")
+    print(f"\n{bold(cyan('minimizer'))}  —  Standalone Hashcat Rule Minimizer\n")
     if args.multibyte:
         print(f"  {cyan('[MB]')}  Multibyte (UTF-8) mode enabled\n")
+
+    # ── resolve workers ───────────────────────────────────────────────
+    workers = os.cpu_count() if args.workers == 0 else max(1, args.workers)
+    if workers > 1:
+        print(f"  {cyan('[MP]')}  Multiprocessing enabled: "
+              f"{bold(str(workers))} workers\n")
 
     # ── read rules ───────────────────────────────────────────────────
     rules = read_rules(args.rules_file)
@@ -1090,7 +1296,9 @@ def main() -> None:
     print()
 
     # ── minimize ─────────────────────────────────────────────────────
-    kept, n_kept, n_removed = minimize_rules(rules, probe, multibyte=args.multibyte)
+    kept, n_kept, n_removed = minimizer(
+        rules, probe, multibyte=args.multibyte, workers=workers
+    )
     pct = n_removed / max(1, len(rules)) * 100
 
     print()
@@ -1100,7 +1308,7 @@ def main() -> None:
 
     # ── write output ─────────────────────────────────────────────────
     with open(args.output, 'w', encoding='utf-8') as fh:
-        fh.write("# minimize_rules — Standalone Hashcat Rule Minimizer\n")
+        fh.write("# minimizer — Standalone Hashcat Rule Minimizer\n")
         fh.write(f"# Generated  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         fh.write(f"# Source     : {os.path.basename(args.rules_file)}\n")
         fh.write(f"# Probe set  : {len(probe)} words\n")
@@ -1121,4 +1329,7 @@ def main() -> None:
 
 
 if __name__ == '__main__':
+    # freeze_support() is a no-op on Linux/macOS but required on Windows
+    # when the script is bundled with PyInstaller (spawn start method).
+    multiprocessing.freeze_support()
     main()
