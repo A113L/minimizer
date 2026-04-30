@@ -69,6 +69,50 @@ def dim(t):    return f"{C.DIM}{t}{C.END}"
 
 
 # ====================================================================
+# --- DEBUG INFRASTRUCTURE ---
+# ====================================================================
+_DEBUG: bool = False          # set to True via --debug flag at runtime
+_DEBUG_FILE = sys.stderr      # debug output target
+
+
+def dbg(msg: str, *, level: str = "DBG") -> None:
+    """Print a debug message to stderr when debug mode is active."""
+    if _DEBUG:
+        tag = {
+            "DBG":  dim(f"[{level}]"),
+            "INFO": cyan(f"[{level}]"),
+            "WARN": yellow(f"[{level}]"),
+            "RULE": bold(f"[{level}]"),
+            "DUP":  red(f"[{level}]"),
+        }.get(level, dim(f"[{level}]"))
+        print(f"{tag} {msg}", file=_DEBUG_FILE)
+
+
+def debug_rule(rule: str, probe: List[str]) -> None:
+    """
+    Trace *rule* applied to every word in *probe* and print the results.
+    Used by --debug-rule to inspect what a specific rule does.
+    """
+    print(f"\n{bold(cyan('Rule trace:'))} {bold(repr(rule))}\n")
+    atoms = tokenize_rule(rule)
+    print(f"  Atoms : {atoms}\n")
+    any_unsupported = False
+    for word in probe:
+        result = apply_chain(rule, word)
+        if result is None:
+            tag = yellow("→  <unsupported>")
+            any_unsupported = True
+        elif result == word:
+            tag = dim(f"→  {result!r}  (no change)")
+        else:
+            tag = green(f"→  {result!r}")
+        print(f"  {dim(repr(word)):32s}  {tag}")
+    if any_unsupported:
+        print(f"\n  {yellow('Warning:')} rule contains unsupported opcode(s).")
+    print()
+
+
+# ====================================================================
 # --- BUILT-IN PROBE SET ---
 # ====================================================================
 # Hand-curated to exercise every interesting opcode category:
@@ -128,6 +172,27 @@ BUILTIN_PROBES: List[str] = [
     "bbbb",
 ]
 
+# Extra probes activated only in multibyte mode (--multibyte).
+# These exercise multibyte UTF-8 encodings: Polish, German, French, CJK, emoji.
+MULTIBYTE_PROBES: List[str] = [
+    # ── Polish ───────────────────────────────────────────────────────
+    "hasło",          # "password" in Polish  (ł = U+0142, 2-byte UTF-8)
+    "żółw",           # "tortoise"            (ż ó ł w — all 2-byte)
+    "źródło",         # "source"
+    # ── German ───────────────────────────────────────────────────────
+    "straße",         # "street"              (ß = U+00DF, 2-byte)
+    "münchen",        # city name             (ü = U+00FC)
+    "übermensch",     # "superhuman"
+    # ── French ───────────────────────────────────────────────────────
+    "café",           # (é = U+00E9)
+    "naïve",          # (ï = U+00EF)
+    # ── Russian ──────────────────────────────────────────────────────
+    "пароль",         # "password" in Russian (all 2-byte Cyrillic)
+    # ── CJK / emoji (3–4 byte sequences) ─────────────────────────────
+    "密码",            # "password" in Chinese (each char = 3-byte UTF-8)
+    "パスワード",       # "password" in Japanese katakana
+]
+
 # Deduplicate while preserving order
 _seen: set = set()
 _deduped: List[str] = []
@@ -161,16 +226,93 @@ def _arg_ord(token: str, pos: int) -> int:
     return ord(token[pos]) if pos < len(token) else 0
 
 
-def _apply_single(rule: str, word: str) -> Optional[str]:
-    """Apply one hashcat rule atom to *word*.  Returns None on unsupported opcode."""
+def _encode_word(word: str, multibyte: bool) -> List[int]:
+    """
+    Encode *word* into a list of byte integers for rule processing.
+
+    When *multibyte* is False (default / hashcat-compatible mode) the word is
+    encoded as latin-1.  Characters outside the latin-1 range raise
+    ``UnicodeEncodeError``, which the caller catches and re-raises or handles.
+
+    When *multibyte* is True the word is encoded as UTF-8 so that any Unicode
+    character is accepted.  Rules then operate on the raw UTF-8 byte sequence,
+    exactly as hashcat does on a UTF-8 wordlist.
+    """
+    enc = 'utf-8' if multibyte else 'latin-1'
+    return list(word.encode(enc))
+
+
+def _decode_bytes(byte_list: List[int], multibyte: bool) -> Optional[str]:
+    """
+    Decode a list of byte integers back to a Python string.
+
+    In multibyte mode UTF-8 is tried first.  If the byte sequence is not valid
+    UTF-8 (which happens when structural rules like ``r``, ``d``, ``{``, etc.
+    split a multibyte code-point across the boundary), we fall back to latin-1
+    rather than returning ``None``.
+
+    Returning ``None`` here would cause ``compute_signature`` to emit the global
+    ``_UNSUPPORTED_SIG`` sentinel for every such rule, making all structurally
+    different rules that happen to produce invalid UTF-8 look identical — and
+    thus falsely removing them as duplicates.
+
+    By falling back to latin-1 (which succeeds for any byte sequence) each rule
+    retains its own unique signature based on the actual byte-level output.
+    """
+    if not multibyte:
+        try:
+            return bytes(byte_list).decode('latin-1')
+        except Exception:
+            return None
+    # multibyte: try UTF-8 first, fall back to latin-1 on invalid sequences
+    try:
+        return bytes(byte_list).decode('utf-8')
+    except (UnicodeDecodeError, ValueError):
+        # Structural rule split a multibyte code-point — preserve raw bytes as
+        # a latin-1 string so the signature still distinguishes different rules.
+        return bytes(byte_list).decode('latin-1')
+
+
+def _apply_single(rule: str, word: str, multibyte: bool = False) -> Optional[str]:
+    """Apply one hashcat rule atom to *word*.  Returns None on unsupported opcode.
+
+    Parameters
+    ----------
+    rule : str
+        A single hashcat opcode atom (e.g. ``'l'``, ``'$1'``, ``'sab'``).
+    word : str
+        The current candidate password string.
+    multibyte : bool
+        When ``True`` the word is treated as a sequence of UTF-8 *bytes*,
+        enabling correct handling of multibyte characters (Polish, German,
+        CJK, emoji, …).  When ``False`` (default) latin-1 byte semantics are
+        used — identical to the original behaviour and to hashcat's default.
+    """
     if not rule:
         return word
-    w   = list(word.encode('latin-1'))
+
+    try:
+        w = _encode_word(word, multibyte)
+    except UnicodeEncodeError:
+        # Word contains characters outside latin-1; silently escalate to UTF-8
+        # even when multibyte mode was not explicitly requested.
+        dbg(
+            f"Word {word!r} contains non-latin-1 chars — forcing UTF-8 encoding",
+            level="WARN",
+        )
+        try:
+            w = list(word.encode('utf-8'))
+            multibyte = True          # decode back as UTF-8 at the end
+        except Exception:
+            return None
+
     cmd = rule[0]
 
     def dg(c: str) -> int:
         """Parse a single decimal digit character, return -1 on failure."""
         return ord(c) - 48 if '0' <= c <= '9' else -1
+
+    dbg(f"  atom={rule!r}  word_before={word!r}", level="DBG")
 
     try:
         # ── no-op ────────────────────────────────────────────────────
@@ -324,10 +466,9 @@ def _apply_single(rule: str, word: str) -> Optional[str]:
     except Exception:
         return None
 
-    try:
-        return bytes(w).decode('latin-1')
-    except Exception:
-        return None
+    result = _decode_bytes(w, multibyte)
+    dbg(f"  atom={rule!r}  word_after={result!r}", level="DBG")
+    return result
 
 
 
@@ -414,7 +555,7 @@ def tokenize_rule(chain: str) -> List[str]:
     return tokens
 
 
-def apply_chain(chain: str, word: str) -> Optional[str]:
+def apply_chain(chain: str, word: str, multibyte: bool = False) -> Optional[str]:
     """
     Apply a hashcat rule chain to *word*.
 
@@ -422,11 +563,21 @@ def apply_chain(chain: str, word: str) -> Optional[str]:
     (``lr$1``) formats, as well as mixed lines.  ``\\xNN`` hex-escape
     notation in argument positions is also supported.
 
+    Parameters
+    ----------
+    chain : str
+        The full rule string (possibly multiple opcode atoms).
+    word : str
+        The candidate password to transform.
+    multibyte : bool
+        When ``True`` the word is processed as UTF-8 bytes, enabling support
+        for multibyte Unicode characters (Polish, German, CJK, emoji, …).
+
     Returns ``None`` if any atom contains an unsupported opcode.
     """
     cur: Optional[str] = word
     for atom in tokenize_rule(chain):
-        cur = _apply_single(atom, cur)  # type: ignore[arg-type]
+        cur = _apply_single(atom, cur, multibyte=multibyte)  # type: ignore[arg-type]
         if cur is None:
             return None
     return cur
@@ -438,7 +589,11 @@ def apply_chain(chain: str, word: str) -> Optional[str]:
 _UNSUPPORTED_SIG: tuple = ('__UNSUPPORTED__',)
 
 
-def compute_signature(rule: str, probe_words: List[str]) -> tuple:
+def compute_signature(
+    rule: str,
+    probe_words: List[str],
+    multibyte: bool = False,
+) -> tuple:
     """
     Return the functional signature of *rule* — a tuple of its outputs on
     every word in *probe_words*.
@@ -446,10 +601,16 @@ def compute_signature(rule: str, probe_words: List[str]) -> tuple:
     If the rule contains an unsupported opcode, returns the sentinel tuple
     ``('__UNSUPPORTED__',)`` so all such rules land in one bucket and the
     first one in file order is retained.
+
+    Parameters
+    ----------
+    multibyte : bool
+        Passed through to ``apply_chain`` / ``_apply_single``.  When ``True``
+        words are treated as UTF-8 byte sequences.
     """
     outputs = []
     for word in probe_words:
-        out = apply_chain(rule, word)
+        out = apply_chain(rule, word, multibyte=multibyte)
         if out is None:
             return _UNSUPPORTED_SIG
         outputs.append(out)
@@ -464,14 +625,16 @@ def build_probe_set(
     probe_file:   Optional[str],
     probe_words:  int,
     seed:         int = 42,
+    multibyte:    bool = False,
 ) -> List[str]:
     """
     Assemble the probe set used for signature computation.
 
     Assembly order (later duplicates are silently dropped):
       1. BUILTIN_PROBES   — always included
-      2. extra_probes     — words supplied via --extra-probes
-      3. sample from probe_file — up to *probe_words* random words
+      2. MULTIBYTE_PROBES — included when *multibyte* is ``True``
+      3. extra_probes     — words supplied via --extra-probes
+      4. sample from probe_file — up to *probe_words* random words
 
     Parameters
     ----------
@@ -483,6 +646,8 @@ def build_probe_set(
         Maximum number of words to sample from *probe_file*.
     seed : int
         RNG seed for reproducible sampling.
+    multibyte : bool
+        When ``True`` the extra MULTIBYTE_PROBES list is added to the set.
     """
     seen: set = set()
     probe: List[str] = []
@@ -495,6 +660,12 @@ def build_probe_set(
 
     for w in BUILTIN_PROBES:
         add(w)
+
+    if multibyte:
+        dbg(f"Adding {len(MULTIBYTE_PROBES)} multibyte probe words", level="INFO")
+        for w in MULTIBYTE_PROBES:
+            add(w)
+
     for w in (extra_probes or []):
         add(w)
 
@@ -557,6 +728,7 @@ _SQLITE_THRESHOLD = 1_000_000
 def _minimize_rules_sqlite(
     rules: List[str],
     probe: List[str],
+    multibyte: bool = False,
 ) -> "tuple[List[str], int, int]":
     """
     SQLite-backed deduplication for large rulesets (> _SQLITE_THRESHOLD rules).
@@ -633,7 +805,7 @@ def _minimize_rules_sqlite(
         conn.execute("BEGIN")
 
         for rule in iterator:
-            sig      = compute_signature(rule, probe)
+            sig      = compute_signature(rule, probe, multibyte=multibyte)
             sig_blob = pickle.dumps(sig, protocol=4)
 
             cur.execute(
@@ -642,10 +814,12 @@ def _minimize_rules_sqlite(
             )
             if cur.rowcount:          # 1 = newly inserted → unique rule
                 kept.append(rule)
+                dbg(f"KEPT  [{len(kept):>6,}]  {rule!r}", level="RULE")
                 if HAS_TQDM:
                     set_postfix({"unique": cyan(str(len(kept)))}, refresh=False)
             else:
                 n_removed += 1
+                dbg(f"DROP  rule={rule!r}", level="DUP")
 
             pending += 1
             if pending >= _BATCH:
@@ -670,12 +844,23 @@ def _minimize_rules_sqlite(
 def minimize_rules(
     rules: List[str],
     probe: List[str],
+    multibyte: bool = False,
 ) -> Tuple[List[str], int, int]:
     """
     Deduplicate *rules* by functional signature over *probe*.
 
     When two rules share the same signature the one appearing *earlier*
     in *rules* is kept (file order = priority).
+
+    Parameters
+    ----------
+    rules : list of str
+        Raw rule strings as read from the rule file.
+    probe : list of str
+        Words used to compute each rule's functional signature.
+    multibyte : bool
+        When ``True`` words are processed as UTF-8 bytes so that rules on
+        non-ASCII (Polish, German, CJK, …) passwords are handled correctly.
 
     Returns
     -------
@@ -688,7 +873,7 @@ def minimize_rules(
     """
     # ── delegate to SQLite path for large rulesets ───────────────────
     if len(rules) > _SQLITE_THRESHOLD:
-        return _minimize_rules_sqlite(rules, probe)
+        return _minimize_rules_sqlite(rules, probe, multibyte=multibyte)
 
     sig_map: dict       = {}   # signature -> rule (first seen)
     kept:    List[str]  = []
@@ -720,14 +905,17 @@ def minimize_rules(
         set_postfix  = _noop_postfix
 
     for rule in iterator:
-        sig = compute_signature(rule, probe)
+        sig = compute_signature(rule, probe, multibyte=multibyte)
         if sig not in sig_map:
             sig_map[sig] = rule
             kept.append(rule)
+            dbg(f"KEPT  [{len(kept):>6,}]  {rule!r}", level="RULE")
             if HAS_TQDM:
                 set_postfix({"unique": cyan(str(len(kept)))}, refresh=False)
         else:
+            dup_of = sig_map[sig]
             n_removed += 1
+            dbg(f"DROP  {rule!r}  ≡  {dup_of!r}", level="DUP")
 
     if not HAS_TQDM:
         print()   # newline after \r progress
@@ -755,7 +943,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    ap.add_argument('rules_file',
+    ap.add_argument('rules_file', nargs='?', default=None,
                     help='Input hashcat rule file to minimize')
     ap.add_argument('-o', '--output', default=None,
                     help='Output file  (default: <rules_file>.minimized.rule)')
@@ -773,15 +961,96 @@ def main() -> None:
     grp.add_argument('--list-probes', action='store_true',
                      help='Print the built-in probe set and exit')
 
+    # ── multibyte / unicode ───────────────────────────────────────────
+    grp2 = ap.add_argument_group('Multibyte / Unicode options')
+    grp2.add_argument('--multibyte', action='store_true',
+                      help=(
+                          'Process words as UTF-8 byte sequences instead of '
+                          'latin-1.  Required for correct handling of Polish, '
+                          'German, French, Russian, CJK, and other non-ASCII '
+                          'characters.  Also adds extra multibyte probe words '
+                          '(see --list-probes).'))
+
+    # ── debug options ─────────────────────────────────────────────────
+    grp3 = ap.add_argument_group('Debug options')
+    grp3.add_argument('--debug', action='store_true',
+                      help=(
+                          'Enable verbose debug output on stderr.  '
+                          'Shows every rule that is kept or removed, '
+                          'and which earlier rule it duplicates.'))
+    grp3.add_argument('--debug-rule', metavar='RULE', default=None,
+                      help=(
+                          'Trace a single rule against the probe set and exit.  '
+                          'Shows the transformation applied to each probe word.  '
+                          'Example: --debug-rule "l r $1"'))
+
     args = ap.parse_args()
+
+    # ── activate debug mode ───────────────────────────────────────────
+    global _DEBUG
+    _DEBUG = args.debug
+
+    if _DEBUG:
+        print(f"{cyan('[DEBUG]')} Debug mode enabled — verbose output on stderr\n",
+              file=sys.stderr)
 
     # ── list probes and exit ──────────────────────────────────────────
     if args.list_probes:
-        print(f"\n{bold('Built-in probe set')}  ({len(BUILTIN_PROBES)} words):\n")
-        for i, w in enumerate(BUILTIN_PROBES, 1):
-            print(f"  {str(i).rjust(3)}.  {w!r}  (len={len(w)})")
+        # ── category 1: built-in (ASCII) ─────────────────────────────
+        print(f"\n{bold(cyan('Category 1 — built-in ASCII probe set'))}  "
+              f"{dim(f'({len(BUILTIN_PROBES)} words)')}\n")
+        # group by the inline comment categories from BUILTIN_PROBES
+        _categories = [
+            ("very short  (edge cases: k K {{ }} [ ])",    slice(0, 3)),
+            ("short alphanumeric  (len 4–6)",              slice(3, 8)),
+            ("typical password base words  (len 7–9)",                        slice(8, 16)),
+            ("longer words  (len 10+, truncation / repeat ops)", slice(16, 21)),
+            ("mixed-case  (l/u/c/C/t/E/T/k/K)",  slice(21, 25)),
+            ("words with digits  (s o @ T)",                     slice(25, 29)),
+            ("special chars  (@ removal, s substitution)",  slice(29, 31)),
+            ("repeated chars  (q doubling, z/Z extend)",     slice(31, 33)),
+        ]
+        for label, sl in _categories:
+            words = BUILTIN_PROBES[sl]
+            if not words:
+                continue
+            print(f"  {bold(label)}")
+            for w in words:
+                print(f"      {dim(repr(w)):32s}  len={len(w)}")
+            print()
+
+        # ── category 2: multibyte (UTF-8) ────────────────────────────
+        print(f"{bold(cyan('Category 2 — multibyte (UTF-8) probe set'))}  "
+              f"{dim(f'({len(MULTIBYTE_PROBES)} words)')}"
+              f"  {dim('activated by --multibyte')}\n")
+        _mb_groups = [
+            ("Polish",    ["hasło", "żółw", "źródło"]),
+            ("German", ["straße", "münchen", "übermensch"]),
+            ("French", ["café", "naïve"]),
+            ("Russian",  ["пароль"]),
+            ("CJK / emoji  (3–4 byte UTF-8 sequences)", ["密码", "パスワード"]),
+        ]
+        for lang, words in _mb_groups:
+            print(f"  {bold(lang)}")
+            for w in words:
+                utf8 = w.encode('utf-8')
+                hex_repr = ' '.join(f'{b:02X}' for b in utf8)
+                active = cyan("✓ active") if args.multibyte else dim("○ inactive")
+                print(f"      {w!r:20s}  "
+                      f"{len(w)} ch / {len(utf8)} B  "
+                      f"utf8=[{hex_repr}]  {active}")
+            print()
+
+        total = len(BUILTIN_PROBES) + (len(MULTIBYTE_PROBES) if args.multibyte else 0)
+        print(f"  {dim('Total active probe words:')} {bold(str(total))}")
+        if not args.multibyte:
+            print(f"  {dim('Use --multibyte --list-probes to activate category 2.')}")
         print()
         sys.exit(0)
+
+    # ── rules_file is required for all other operations ───────────────
+    if args.rules_file is None:
+        ap.error("rules_file is required (or use --list-probes)")
 
     # ── default output name ───────────────────────────────────────────
     if args.output is None:
@@ -790,6 +1059,8 @@ def main() -> None:
 
     # ── banner ────────────────────────────────────────────────────────
     print(f"\n{bold(cyan('minimize_rules'))}  —  Standalone Hashcat Rule Minimizer\n")
+    if args.multibyte:
+        print(f"  {cyan('[MB]')}  Multibyte (UTF-8) mode enabled\n")
 
     # ── read rules ───────────────────────────────────────────────────
     rules = read_rules(args.rules_file)
@@ -802,7 +1073,13 @@ def main() -> None:
         probe_file=args.probe_file,
         probe_words=args.probe_words,
         seed=args.seed,
+        multibyte=args.multibyte,
     )
+
+    # ── --debug-rule: trace one rule and exit ─────────────────────────
+    if args.debug_rule is not None:
+        debug_rule(args.debug_rule, probe)
+        sys.exit(0)
     print(f"[PRB]  Probe set: {bold(str(len(probe)))} words")
     if len(probe) <= 40:
         # print the probe set so the user can verify it looks right
@@ -813,7 +1090,7 @@ def main() -> None:
     print()
 
     # ── minimize ─────────────────────────────────────────────────────
-    kept, n_kept, n_removed = minimize_rules(rules, probe)
+    kept, n_kept, n_removed = minimize_rules(rules, probe, multibyte=args.multibyte)
     pct = n_removed / max(1, len(rules)) * 100
 
     print()
