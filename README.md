@@ -17,6 +17,8 @@ rule "l"   (duplicate) ───────────────────
 
 The built-in probe set (33 words) is hand-curated to exercise every opcode category: very short words for edge cases (`k`, `K`, `{`, `}`, `[`, `]`), mixed-case words for `l`/`u`/`c`/`C`/`t`/`E`/`T`, digit-bearing words for `s`/`o`/`@`, special-char words, repeated-char words for `q`/`z`/`Z`, and words of length 7–11 for truncation and repeat ops. Every hashcat opcode the GPU kernel supports is implemented in pure Python.
 
+In `--multibyte` mode a second probe category (11 words) is added covering Polish, German, French, Russian, and CJK characters. Words are then processed as raw UTF-8 byte sequences, matching hashcat's behaviour on non-ASCII wordlists.
+
 ---
 
 ## Requirements
@@ -80,17 +82,116 @@ python minimizer.py ruleset.rule -o minimized.rule \
 python minimizer.py ruleset.rule --probe-file rockyou.txt --seed 1337
 ```
 
+### Multibyte / Unicode mode
+
+Pass `--multibyte` when your wordlists contain non-ASCII characters (Polish, German, French, Russian, CJK, emoji, etc.). Without this flag, words are processed as latin-1 bytes and any character outside that range triggers an automatic UTF-8 fallback with a warning.
+
+```bash
+# Enable UTF-8 byte-level processing
+python minimizer.py ruleset.rule -o minimized.rule --multibyte
+
+# Multibyte + extra non-ASCII probes from a wordlist
+python minimizer.py ruleset.rule -o minimized.rule \
+    --multibyte --probe-file polish-wordlist.txt --probe-words 50
+```
+
+**What changes in multibyte mode:**
+
+- Words are encoded as UTF-8 bytes rather than latin-1 bytes before rules are applied.
+- The 11-word multibyte probe set (see `--list-probes --multibyte`) is added to the signature computation, giving the minimizer more signal to distinguish rules that behave differently on non-ASCII input.
+- Structural rules (`r`, `d`, `f`, `{`, `}`, `q`, etc.) that split a multibyte code-point across a byte boundary produce byte sequences that are no longer valid UTF-8. These are decoded as latin-1 rather than returning `None`, so each rule retains its own unique signature and is not falsely collapsed with other rules that happen to produce different invalid sequences.
+
+### Debug options
+
+#### `--debug`
+
+Prints every keep/drop decision to stderr. Dropped rules show which earlier rule they duplicate.
+
+```bash
+python minimizer.py ruleset.rule -o out.rule --debug 2>debug.log
+```
+
+```
+[RULE] KEPT  [     1]  'l'
+[RULE] KEPT  [     2]  'u'
+[DUP]  DROP  'l' ≡ 'l'
+[RULE] KEPT  [     3]  'r'
+```
+
+#### `--debug-rule RULE`
+
+Traces a single rule against the entire probe set and exits — no input file required. Useful for understanding what a rule does before or after minimisation.
+
+```bash
+python minimizer.py --debug-rule "l r \$1"
+python minimizer.py --debug-rule "sab" --multibyte
+```
+
+```
+Rule trace: 'l r $1'
+
+  Atoms : ['l', 'r', '$1']
+
+  'ab'          →  'ba1'
+  'Password'    →  'drowssap1'
+  'hasło'       →  ...
+```
+
+Changed words are highlighted in green; unchanged words are dimmed. Unsupported opcodes are flagged with a warning.
+
+### Listing the probe set
+
+`--list-probes` can be used **without a rules file**:
+
+```bash
+# Show built-in ASCII probes only
+python minimizer.py --list-probes
+
+# Show both categories with multibyte activation status
+python minimizer.py --list-probes --multibyte
+```
+
+Output is grouped into two categories:
+
+**Category 1 — built-in ASCII** (33 words, always active):
+
+| Group | Words |
+|---|---|
+| Very short — edge cases | `ab` `abc` `abcd` |
+| Short alphanumeric | `pass` `root` `test` `admin` `login` |
+| Typical password base words | `letmein` `welcome` `password` … |
+| Longer words | `qwertyuiop` `iloveyou12` … |
+| Mixed-case | `Password` `AdminUser` `MySecret` `HelloWorld` |
+| Words with digits | `pass123` `admin2024` … |
+| Special chars | `p@ssw0rd` `s3cur1ty` |
+| Repeated chars | `aaaa` `bbbb` |
+
+**Category 2 — multibyte UTF-8** (11 words, active with `--multibyte`):
+
+| Language | Words |
+|---|---|
+| Polish | `hasło` `żółw` `źródło` |
+| German | `straße` `münchen` `übermensch` |
+| French | `café` `naïve` |
+| Russian | `пароль` |
+| CJK / emoji | `密码` `パスワード` |
+
+Each category 2 entry is shown with its character count, byte count, and full UTF-8 hex encoding.
+
 ### All options
 
 | Flag | Default | Description |
 |---|---|---|
-| `rules_file` | *(required)* | Input hashcat rule file |
+| `rules_file` | *(required unless `--list-probes` or `--debug-rule`)* | Input hashcat rule file |
 | `-o / --output` | `<input>.minimized.rule` | Output file path |
 | `--extra-probes WORD …` | — | Extra probe words appended to the built-in set |
 | `--probe-file FILE` | — | Wordlist to sample extra probes from |
 | `--probe-words N` | `50` | Max words to sample from `--probe-file` |
 | `--seed N` | `42` | RNG seed for reproducible probe sampling |
-| `--list-probes` | — | Print built-in probe set and exit |
+| `--list-probes` | — | Print probe set in two categories and exit |
+| `--multibyte` | — | Process words as UTF-8 bytes; add multibyte probe words |
+| `--debug` | — | Log every keep/drop decision to stderr |
+| `--debug-rule RULE` | — | Trace one rule against the probe set and exit |
 
 ---
 
