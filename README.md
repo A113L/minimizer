@@ -2,8 +2,6 @@
 
 A standalone Python tool that eliminates functionally redundant rules from hashcat rule files. Two rules are considered equivalent if they produce **identical output on every word in the probe set** — if they can't be told apart, one of them is waste.
 
-Rulesets with more than 1 million rules automatically use a SQLite-backed signature store to avoid out-of-memory errors, with no change in behaviour or output.
-
 ---
 
 ## How it works
@@ -19,13 +17,17 @@ The built-in probe set (33 words) is hand-curated to exercise every opcode categ
 
 In `--multibyte` mode a second probe category (11 words) is added covering Polish, German, French, Russian, and CJK characters. Words are then processed as raw UTF-8 byte sequences, matching hashcat's behaviour on non-ASCII wordlists.
 
+### Signature store
+
+All deduplication uses a temporary **SQLite database** regardless of ruleset size. Signatures are stored as binary blobs keyed by `INSERT OR IGNORE`, so the signature map never occupies Python heap memory. The temp file (`minimizer_tmp_<pid>.db`) is created in the current working directory and deleted unconditionally on completion, including on error or `Ctrl+C`.
+
 ---
 
 ## Requirements
 
 - Python 3.7+
-- No mandatory dependencies — `sqlite3` and `pickle` are stdlib
-- [`tqdm`](https://github.com/tqdm/tqdm) *(optional)* — enables the progress bar
+- No mandatory dependencies — `sqlite3`, `pickle`, and `multiprocessing` are stdlib
+- [`tqdm`](https://github.com/tqdm/tqdm) *(optional)* — enables rich progress bars
 
 ```bash
 pip install tqdm
@@ -59,6 +61,20 @@ python minimizer.py rockyou-30000.rule
 # Specify output path explicitly
 python minimizer.py rockyou-30000.rule -o rockyou-min.rule
 ```
+
+### Parallel processing
+
+Use `--workers N` to distribute the signature-computation phase across multiple CPU cores. The deduplication step always runs on the main process.
+
+```bash
+# Use 8 worker processes
+python minimizer.py rockyou-30000.rule -o out.rule --workers 8
+
+# Auto-detect CPU count
+python minimizer.py rockyou-30000.rule -o out.rule --workers 0
+```
+
+`--workers 1` (default) disables multiprocessing entirely — no subprocess overhead for small rulesets.
 
 ### Probe set options
 
@@ -99,7 +115,7 @@ python minimizer.py ruleset.rule -o minimized.rule \
 
 - Words are encoded as UTF-8 bytes rather than latin-1 bytes before rules are applied.
 - The 11-word multibyte probe set (see `--list-probes --multibyte`) is added to the signature computation, giving the minimizer more signal to distinguish rules that behave differently on non-ASCII input.
-- Structural rules (`r`, `d`, `f`, `{`, `}`, `q`, etc.) that split a multibyte code-point across a byte boundary produce byte sequences that are no longer valid UTF-8. These are decoded as latin-1 rather than returning `None`, so each rule retains its own unique signature and is not falsely collapsed with other rules that happen to produce different invalid sequences.
+- Structural rules (`r`, `d`, `f`, `{`, `}`, `q`, etc.) that split a multibyte code-point across a byte boundary produce byte sequences that are no longer valid UTF-8. These are wrapped in an `InvalidUTF8Bytes` object rather than silently decoded as latin-1. This preserves each rule's unique signature so no rules are falsely collapsed, and makes the invalid-UTF-8 case explicitly detectable when the tool is used as a library.
 
 ### Debug options
 
@@ -134,10 +150,10 @@ Rule trace: 'l r $1'
 
   'ab'          →  'ba1'
   'Password'    →  'drowssap1'
-  'hasło'       →  ...
+  'hasło'       →  <invalid UTF-8: 6f 82 c5 73 61 68 31>   ← structural split
 ```
 
-Changed words are highlighted in green; unchanged words are dimmed. Unsupported opcodes are flagged with a warning.
+Changed words are highlighted in green; unchanged words are dimmed. Rules producing invalid UTF-8 byte sequences (structural rules on multibyte characters) are flagged with an explanatory note. Unsupported opcodes are flagged with a warning.
 
 ### Listing the probe set
 
@@ -190,25 +206,30 @@ Each category 2 entry is shown with its character count, byte count, and full UT
 | `--seed N` | `42` | RNG seed for reproducible probe sampling |
 | `--list-probes` | — | Print probe set in two categories and exit |
 | `--multibyte` | — | Process words as UTF-8 bytes; add multibyte probe words |
+| `--workers N` | `1` | Worker processes for parallel signature computation; `0` = auto-detect |
 | `--debug` | — | Log every keep/drop decision to stderr |
 | `--debug-rule RULE` | — | Trace one rule against the probe set and exit |
 
 ---
 
-## Large rulesets (SQLite mode)
+## Progress bars
 
-Rulesets over **1 million rules** automatically switch to a SQLite-backed signature store. This keeps the signature map off the Python heap, preventing OOM kills that occur when storing millions of tuple-keyed dict entries.
+Two progress bars are shown for every run, regardless of ruleset size:
 
 ```
-[DB]  Ruleset exceeds 1,000,000 rules — using SQLite backing store
-      /your/cwd/minimizer_tmp_12345.db
-  Minimizing  |████████████| 1,200,000/1,200,000 [02:14<00:00] unique=847,312
-  [DB]  Temporary database removed.
+  Computing  |████████████| 30,000/30,000 [00:08<00:00]
+  Deduplicating  |████████████| 30,000/30,000 [00:01<00:00] unique=21438
 ```
 
-The temp file (`minimizer_tmp_<pid>.db`) is created in the **current working directory** and deleted unconditionally on completion, including on error or `Ctrl+C`. Nothing is left behind.
+With `--workers N > 1` the first bar tracks completed chunks rather than individual rules:
 
-In-memory mode is used for rulesets under the threshold — no SQLite overhead for everyday use.
+```
+  [MP]  Parallel signature computation: 8 workers, 32 chunks (~938 rules each)
+  Computing  |████████████| 32/32 chunks [00:02<00:00]
+  Deduplicating  |████████████| 30,000/30,000 [00:01<00:00] unique=21438
+```
+
+Both bars fall back gracefully to plain `N/total (X%)` counter lines when `tqdm` is not installed.
 
 ---
 
@@ -232,7 +253,7 @@ The output file is a valid hashcat rule file with a short header comment block:
 hashcat --stdout -r minimized.rule password.txt | sort -u | wc -l
 ```
 
-Compare against the same command run on the original — the unique output count should be similar, confirming no distinct transformations were removed.
+Compare against the same command run on the original — the unique output count should be identical, confirming no distinct transformations were removed.
 
 ---
 
