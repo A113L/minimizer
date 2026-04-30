@@ -238,7 +238,7 @@ Both bars fall back gracefully to plain `N/total (X%)` counter lines when `tqdm`
 The output file is a valid hashcat rule file with a short header comment block:
 
 ```
-# minimize_rules — Standalone Hashcat Rule Minimizer
+# minimizer — Standalone Hashcat Rule Minimizer
 # Generated  : 2026-04-24 14:30:00
 # Source     : rockyou-30000.rule
 # Probe set  : 33 words
@@ -253,7 +253,7 @@ The output file is a valid hashcat rule file with a short header comment block:
 hashcat --stdout -r minimized.rule password.txt | sort -u | wc -l
 ```
 
-Compare against the same command run on the original — the unique output count should be identical, confirming no distinct transformations were removed.
+Compare against the same command run on the original — the unique output count should be similar, confirming no distinct transformations were removed.
 
 ---
 
