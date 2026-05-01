@@ -32,6 +32,7 @@ Usage
 
 import argparse
 import datetime
+import hashlib
 import multiprocessing
 import os
 import pickle
@@ -388,8 +389,10 @@ def _apply_single(
     cmd = rule[0]
 
     def dg(c: str) -> int:
-        """Parse a single decimal digit character, return -1 on failure."""
-        return ord(c) - 48 if '0' <= c <= '9' else -1
+        """Parse a single position character: 0-9 → 0-9, A-Z → 10-35, else -1."""
+        if '0' <= c <= '9': return ord(c) - 48
+        if 'A' <= c <= 'Z': return ord(c) - 55   # A=10, B=11, …, Z=35
+        return -1
 
     dbg(f"  atom={rule!r}  word_before={word!r}", level="DBG")
 
@@ -415,9 +418,21 @@ def _apply_single(
             w = [c | 0x20 if 65 <= c <= 90 else
                  (c & ~0x20 if 97 <= c <= 122 else c) for c in w]
         elif cmd == 'E':
-            out: list = []; cap = True
+            # Title-case: lowercase everything, then uppercase the first letter
+            # and every letter that immediately follows a space (32), hyphen (45)
+            # or underscore (95).
+            # wiki example: "p@ssW0rd w0rld" → "P@ssw0rd W0rld"
+            # The 'W' in W0rd must become 'w' — so we must also lowercase uppercase
+            # letters that are NOT at a word-start position.
+            out = []
+            cap = True
             for c in w:
-                out.append(c & ~0x20 if cap and 97 <= c <= 122 else c)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)   # lowercase → uppercase (word start)
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)    # uppercase → lowercase (non-word-start)
+                else:
+                    out.append(c)
                 cap = c in (32, 45, 95)
             w = out
 
@@ -486,8 +501,10 @@ def _apply_single(
             delta = 1 if cmd == '.' else -1
             if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
         elif cmd == "'" and len(rule) >= 2:
+            # 'N — truncate: keep only the first N characters (w[:N])
+            # wiki example: '6 on "p@ssW0rd" → "p@ssW0" (6 chars, indices 0-5)
             p = dg(rule[1])
-            if 0 <= p < len(w): w = w[:p + 1]
+            if 0 <= p: w = w[:p]
         elif cmd == 'z' and len(rule) >= 2:
             n = dg(rule[1])
             if n > 0 and w: w = [w[0]] * n + w
@@ -512,15 +529,26 @@ def _apply_single(
             p, ch = dg(rule[1]), _arg_ord(rule, 2)
             if 0 <= p < len(w): w[p] = ch
         elif cmd == 'e' and len(rule) >= 2:
-            sep = _arg_ord(rule, 1); out = []; cap = True
+            # Title-case with custom separator: lowercase everything, then uppercase
+            # the first letter and every letter after the separator character.
+            sep = _arg_ord(rule, 1)
+            out = []
+            cap = True
             for c in w:
-                out.append(c & ~0x20 if cap and 97 <= c <= 122 else c)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)   # lowercase → uppercase
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)    # uppercase → lowercase
+                else:
+                    out.append(c)
                 cap = (c == sep)
             w = out
         elif cmd == 'x' and len(rule) >= 3:
-            a, b = dg(rule[1]), dg(rule[2])
-            if a > b: a, b = b, a
-            w = w[a:b + 1]
+            # xNM — extract M characters starting at position N
+            # hashcat semantics: w = w[N : N+M]  (M is a count, not an end index)
+            n, m = dg(rule[1]), dg(rule[2])
+            if n >= 0 and m >= 0:
+                w = w[n:n + m]
         elif cmd == 'O' and len(rule) >= 3:
             p, m = dg(rule[1]), dg(rule[2])
             if 0 <= p < len(w) and m > 0: w = w[:p] + w[p + m:]
@@ -529,12 +557,18 @@ def _apply_single(
             if 0 <= a < len(w) and 0 <= b < len(w) and a != b:
                 w[a], w[b] = w[b], w[a]
         elif cmd == '3' and len(rule) >= 3:
+            # 3NX — toggle case of the letter after the Nth instance of separator X
+            # N is 0-based: 30- toggles after the FIRST '-', 31- after the SECOND, etc.
+            # Bug fix: previously cnt was incremented BEFORE the comparison, so n=0
+            # (first separator) would require cnt==0 AFTER incrementing (impossible).
+            # Fix: compare cnt == n after incrementing — but n is 0-based so we
+            # compare cnt == n+1, i.e. match on the (n+1)th time we see the separator.
             n, sep = dg(rule[1]), _arg_ord(rule, 2)
             cnt = 0
             for i, c in enumerate(w):
                 if c == sep:
                     cnt += 1
-                    if cnt == n and i + 1 < len(w):
+                    if cnt == n + 1 and i + 1 < len(w):
                         ci = w[i + 1]
                         w[i + 1] = (ci | 0x20 if 65 <= ci <= 90
                                     else (ci & ~0x20 if 97 <= ci <= 122 else ci))
@@ -688,9 +722,13 @@ def compute_signature(
     Return the functional signature of *rule* — a tuple of its outputs on
     every word in *probe_words*.
 
-    If the rule contains an unsupported opcode, returns the sentinel tuple
-    ``('__UNSUPPORTED__',)`` so all such rules land in one bucket and the
-    first one in file order is retained.
+    If the rule contains an unsupported opcode, returns a unique sentinel
+    tuple that embeds the rule text itself, so that two different unsupported
+    rules are never mistakenly identified as duplicates of each other.
+
+    The old behaviour (all unsupported rules → one shared bucket) caused
+    false deduplication: e.g. 100 rules using reject ops (<, >, !, /, …) or
+    memory ops (M, 4, 6, X) would all collapse to a single kept rule.
 
     Parameters
     ----------
@@ -702,7 +740,9 @@ def compute_signature(
     for word in probe_words:
         out = apply_chain(rule, word, multibyte=multibyte)
         if out is None:
-            return _UNSUPPORTED_SIG
+            # Unsupported opcode — return a signature that is unique to THIS rule
+            # so it is never collapsed with a different unsupported rule.
+            return ('__UNSUPPORTED__', rule)
         outputs.append(out)
     return tuple(outputs)
 
@@ -839,7 +879,12 @@ def _sig_worker(args: tuple) -> List[tuple]:
     for rule in rules_slice:
         sig      = compute_signature(rule, probe, multibyte=multibyte)
         sig_blob = pickle.dumps(sig, protocol=4)
-        out.append((rule, sig_blob))
+        # Use a fixed-length SHA-256 hex digest as the dedup key.
+        # A raw pickle blob as SQLite PRIMARY KEY is not indexable (BLOB type
+        # forces a full-scan on every INSERT OR IGNORE).  A 64-char TEXT hash
+        # gets a proper B-tree index → fast lookups even on 10M+ rule sets.
+        sig_key  = hashlib.sha256(sig_blob).hexdigest()
+        out.append((rule, sig_key))
     return out
 
 
@@ -879,7 +924,7 @@ def _minimizer_sqlite(
             PRAGMA temp_store   = MEMORY;
             PRAGMA cache_size   = -65536;
         """)
-        cur.execute("CREATE TABLE sigs (sig BLOB PRIMARY KEY)")
+        cur.execute("CREATE TABLE sigs (sig TEXT PRIMARY KEY)")
         conn.commit()
 
         kept: List[str] = []
@@ -1012,7 +1057,8 @@ def _compute_sigs_parallel(
         for rule in iterator:
             sig      = compute_signature(rule, probe, multibyte=multibyte)
             sig_blob = pickle.dumps(sig, protocol=4)
-            result.append((rule, sig_blob))
+            sig_key  = hashlib.sha256(sig_blob).hexdigest()
+            result.append((rule, sig_key))
 
         if not HAS_TQDM:
             print()   # newline after \r
