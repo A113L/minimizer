@@ -87,20 +87,21 @@ except ImportError:
 
 class InvalidUTF8Bytes:
     """
-    Wrapper dla ciągu bajtów który NIE jest poprawnym UTF-8.
+    Wrapper for a byte sequence that is NOT valid UTF-8.
 
-    Powstaje gdy reguła strukturalna (r, d, {, }, q, …) rozerwie
-    wielobajtowy znak UTF-8 na granicy bajtów w trybie ``--multibyte``.
+    Produced when a structural rule (r, d, {, }, q, …) splits a
+    multibyte UTF-8 code-point across a byte boundary in ``--multibyte``
+    mode.
 
-    Zamiast cichego fallbacku do latin-1 (który zwraca zwykły ``str``
-    nie do odróżnienia od poprawnego tekstu), ten typ jawnie sygnalizuje
-    że dane są "uszkodzone" bajtowo.
+    Instead of silently falling back to latin-1 (which returns a plain
+    ``str`` indistinguishable from correctly decoded text), this type
+    explicitly signals that the data is byte-corrupted.
 
-    Właściwości:
-      • haszowany i porównywalny po surowych bajtach
-        → nadaje się jako element sygnatury w ``dict``/``set``/``pickle``
-      • ``repr`` jawnie sygnalizuje niepoprawny UTF-8
-      • ``.raw`` : ``bytes`` — oryginalne bajty bez konwersji
+    Properties:
+      • hashed and compared by raw bytes
+        → safe as a signature element in ``dict`` / ``set`` / ``pickle``
+      • ``repr`` clearly flags invalid UTF-8
+      • ``.raw`` : ``bytes`` — original bytes without conversion
     """
 
     __slots__ = ('raw',)
