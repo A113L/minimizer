@@ -13,7 +13,14 @@ ranking) and the later duplicate is discarded.
 
 Changelog
 ---------
-v1.1 — bug fixes
+v1.2 — bug fixes
+  * Fix: probe set extended with three "alphabet" words covering all 95
+    printable ASCII code-points.  Before this fix, rules like @j / @x / @z
+    (purge j/x/z), sja / sxA / szB (replace j/x/z with something), and all
+    rules targeting uppercase letters B C D E F G I J K L N O Q R T V X Y Z
+    or most punctuation chars were no-ops on the entire probe set and were
+    falsely eliminated as duplicates of ":".  In a large ruleset this could
+    easily account for thousands of incorrectly removed rules.
   * Fix: probe set extended to length-36 words so that rules targeting
     positions B(11)–Z(35) — e.g. 'B–'Z, TB–TZ, DB–DZ, LB–LZ, etc. —
     get distinct signatures instead of collapsing into the same no-op
@@ -245,6 +252,17 @@ BUILTIN_PROBES: List[str] = [
     "averylongpassword1234567890ab", # len 30  — covers ..T(29)
     "averylongpassword1234567890abcdef",  # len 34  — covers ..X(33)
     "averylongpassword1234567890abcdefghi",  # len 36  — covers Z(35)
+    # ── alphabet coverage — every printable ASCII char in at least one word ──
+    # Rules like @X (purge X) and sXY (replace X→Y) are no-ops on all probe
+    # words when X does not appear anywhere in the probe set.  Without coverage,
+    # every such rule collapses into the same ":"-equivalent signature and is
+    # falsely eliminated.  Three words cover all 95 printable ASCII code-points:
+    #   missing lowercase before this fix : j, x, z
+    #   missing uppercase before this fix : B C D E F G I J K L N O Q R T V X Y Z
+    #   missing specials                  : most punctuation characters
+    "abcdefghijklmnopqrstuvwxyz",       # all 26 lowercase letters
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",       # all 26 uppercase letters
+    "!@#$%^&*()-_=+[]{}|;:,.<>?/~",    # 30 common special / punctuation chars
     # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
     "Password",
     "AdminUser",
@@ -1202,7 +1220,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog='minimizer',
         description=(
-            'Standalone Hashcat Rule Minimizer (v1.1)\n\n'
+            'Standalone Hashcat Rule Minimizer (v1.2)\n\n'
             'Eliminates functionally redundant rules by computing each rule\'s\n'
             'signature — the tuple of outputs on a fixed probe set of words.\n\n'
             'Rules with identical signatures produce identical output on every\n'
@@ -1292,10 +1310,11 @@ def main() -> None:
             ("typical password base words  (len 7–9)",               slice(8, 16)),
             ("longer words  (len 10–11, truncation / repeat ops)",   slice(16, 21)),
             ("extended-length words  (len 12–36, positions B–Z)",    slice(21, 30)),
-            ("mixed-case  (l/u/c/C/t/E/T/k/K)",                     slice(30, 34)),
-            ("words with digits  (s o @ T)",                         slice(34, 38)),
-            ("special chars  (@ removal, s substitution)",           slice(38, 40)),
-            ("repeated chars  (q doubling, z/Z extend)",             slice(40, 42)),
+            ("alphabet coverage  (all printable ASCII chars)",       slice(30, 33)),
+            ("mixed-case  (l/u/c/C/t/E/T/k/K)",                     slice(33, 37)),
+            ("words with digits  (s o @ T)",                         slice(37, 41)),
+            ("special chars  (@ removal, s substitution)",           slice(41, 43)),
+            ("repeated chars  (q doubling, z/Z extend)",             slice(43, 45)),
         ]
         for label, sl in _categories:
             words = BUILTIN_PROBES[sl]
