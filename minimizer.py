@@ -11,9 +11,25 @@ every probe word.  When a collision is found, the rule appearing *earlier*
 in the input file is kept (preserving the original sort order / frequency
 ranking) and the later duplicate is discarded.
 
+Changelog
+---------
+v1.1 — bug fixes
+  * Fix: probe set extended to length-36 words so that rules targeting
+    positions B(11)–Z(35) — e.g. 'B–'Z, TB–TZ, DB–DZ, LB–LZ, etc. —
+    get distinct signatures instead of collapsing into the same no-op
+    bucket and being falsely eliminated.  This was the main cause of
+    lost cracks with rulesets that use high-position opcodes.
+  * Fix: opcode E now uses only ASCII space (0x20) as the word separator,
+    matching hashcat's documented behaviour.  Previously hyphen (0x2D)
+    and underscore (0x5F) were also treated as separators, producing
+    wrong signatures for words like "my-password" or "my_password".
+  * Fix: read_rules() now strips inline comments (trailing " # ...") so
+    that rules annotated with comments are parsed and compared correctly
+    instead of being given unsupported-opcode signatures.
+
 Usage
 -----
-    # Basic — uses only the built-in probe set (30 words)
+    # Basic — uses only the built-in probe set
     python minimizer.py ruleset.rule -o minimized.rule
 
     # Add extra probe words on the CLI
@@ -205,12 +221,30 @@ BUILTIN_PROBES: List[str] = [
     "baseball",         # len 8
     "princess",         # len 8
     "dragon12",         # len 8, ends with digits
-    # ── longer words (len 10+) — truncation / repeat ops ─────────────
+    # ── longer words (len 10–11) — truncation / repeat ops ──────────
     "qwertyuiop",       # len 10
     "iloveyou12",       # len 10, trailing digits
     "monkey12345",      # len 11
     "superman123",      # len 11
     "mustang2024",      # len 11
+    # ── extended-length words — cover high-position opcodes (B–Z) ────
+    # Hashcat position args go 0-9 then A(10), B(11), ..., Z(35).
+    # Without words of length ≥ 12 every rule that only touches position
+    # 11+ is a no-op on the entire probe set and collapses into the same
+    # signature as ":" — causing massive false deduplication.
+    # We add words at lengths 12, 16, 20, 24, 28 and 36 so that:
+    #   • 'B (truncate@11) differs from 'C (truncate@12) etc.
+    #   • TB-TZ, DB-DZ, LB-LZ, RB-RZ, +B-+Z, -B--Z, .B-.Z, ,B-,Z
+    #     oNX, iNX, xNM  all get distinguishable signatures.
+    "administrator1",   # len 14  — covers positions B(11)..D(13)
+    "iloveyouforever",  # len 15  — covers positions B(11)..E(14)
+    "qwertyuiopasdfgh", # len 16  — covers positions B(11)..F(15)
+    "correcthorsebattery",   # len 20  — covers ..J(19)
+    "averylongpassword1234",  # len 22  — covers ..L(21)
+    "averylongpassword12345678",    # len 26  — covers ..P(25)
+    "averylongpassword1234567890ab", # len 30  — covers ..T(29)
+    "averylongpassword1234567890abcdef",  # len 34  — covers ..X(33)
+    "averylongpassword1234567890abcdefghi",  # len 36  — covers Z(35)
     # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
     "Password",
     "AdminUser",
@@ -433,7 +467,7 @@ def _apply_single(
                     out.append(c | 0x20)    # uppercase → lowercase (non-word-start)
                 else:
                     out.append(c)
-                cap = c in (32, 45, 95)
+                cap = (c == 32)  # only space is a word separator for E (hashcat-compatible)
             w = out
 
         # ── structural transforms ────────────────────────────────────
@@ -830,14 +864,19 @@ def read_rules(path: str) -> List[str]:
     """
     Read *path* and return all non-blank, non-comment lines.
 
-    Comment lines start with '#'.  Both Windows (\\r\\n) and Unix (\\n)
-    line endings are handled.
+    Comment lines start with '#'.  Inline comments (trailing ' # ...')
+    are stripped so that rules like ``l r # note`` are correctly parsed
+    as ``l r``.  Both Windows (\\r\\n) and Unix (\\n) line endings are
+    handled.
     """
     rules: List[str] = []
     try:
         with open(path, encoding='utf-8', errors='ignore') as fh:
             for line in fh:
                 r = line.rstrip('\r\n')
+                # Strip inline comments: first '#' not at position 0
+                if '#' in r and not r.startswith('#'):
+                    r = r[:r.index('#')].rstrip()
                 if r and not r.startswith('#'):
                     rules.append(r)
     except FileNotFoundError:
@@ -1163,15 +1202,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog='minimizer',
         description=(
-            'Standalone Hashcat Rule Minimizer\n\n'
+            'Standalone Hashcat Rule Minimizer (v1.1)\n\n'
             'Eliminates functionally redundant rules by computing each rule\'s\n'
             'signature — the tuple of outputs on a fixed probe set of words.\n\n'
             'Rules with identical signatures produce identical output on every\n'
             'probe word and are therefore indistinguishable by hashcat.  Only\n'
             'the rule appearing first in the input file is retained.\n\n'
             'The built-in probe set covers short words (including "password"),\n'
-            'mixed-case words, words with digits/specials, and repeated-char\n'
-            'words — so the minimization is accurate without a wordlist file.'
+            'mixed-case words, words with digits/specials, repeated-char\n'
+            'words, and words up to length 36 so that rules using high\n'
+            'position arguments (A–Z) are correctly distinguished.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1247,14 +1287,15 @@ def main() -> None:
               f"{dim(f'({len(BUILTIN_PROBES)} words)')}\n")
         # group by the inline comment categories from BUILTIN_PROBES
         _categories = [
-            ("very short  (edge cases: k K {{ }} [ ])",    slice(0, 3)),
-            ("short alphanumeric  (len 4–6)",              slice(3, 8)),
-            ("typical password base words  (len 7–9)",                        slice(8, 16)),
-            ("longer words  (len 10+, truncation / repeat ops)", slice(16, 21)),
-            ("mixed-case  (l/u/c/C/t/E/T/k/K)",  slice(21, 25)),
-            ("words with digits  (s o @ T)",                     slice(25, 29)),
-            ("special chars  (@ removal, s substitution)",  slice(29, 31)),
-            ("repeated chars  (q doubling, z/Z extend)",     slice(31, 33)),
+            ("very short  (edge cases: k K {{ }} [ ])",              slice(0, 3)),
+            ("short alphanumeric  (len 4–6)",                        slice(3, 8)),
+            ("typical password base words  (len 7–9)",               slice(8, 16)),
+            ("longer words  (len 10–11, truncation / repeat ops)",   slice(16, 21)),
+            ("extended-length words  (len 12–36, positions B–Z)",    slice(21, 30)),
+            ("mixed-case  (l/u/c/C/t/E/T/k/K)",                     slice(30, 34)),
+            ("words with digits  (s o @ T)",                         slice(34, 38)),
+            ("special chars  (@ removal, s substitution)",           slice(38, 40)),
+            ("repeated chars  (q doubling, z/Z extend)",             slice(40, 42)),
         ]
         for label, sl in _categories:
             words = BUILTIN_PROBES[sl]
