@@ -13,12 +13,15 @@ ranking) and the later duplicate is discarded.
 
 Changelog
 ---------
-v1.3 — new feature
+v1.3 — new feature + probe fix
   * New: --debug-file FILE traces every rule in FILE against the probe set
-    and exits.  Designed for bulk inspection of rules from comm/diff output
-    (e.g. the dropped_rules.txt produced by comm -23).  Blank lines and
-    #-comment lines are skipped; output is identical to running --debug-rule
-    for each rule in sequence, with a separator every 10 rules.
+    and exits.  Designed for bulk inspection of rules from comm/diff output.
+  * Fix: four remaining printable ASCII chars not covered by earlier probe
+    words (backtick 0x60, double-quote 0x22, single-quote 0x27, backslash
+    0x5C) are now represented by dedicated mid-word probe strings ("a`b",
+    'a"b', "a'b", "a\\b").  This closes the last gap in printable-ASCII
+    coverage and eliminates the residual 8-output difference seen after
+    the v1.2 fixes.
 
 v1.2 — bug fixes
   * Fix: probe set extended with three "alphabet" words covering all 95
@@ -269,6 +272,14 @@ BUILTIN_PROBES: List[str] = [
     "abcdefghijklmnopqrstuvwxyz",       # all 26 lowercase letters
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",       # all 26 uppercase letters
     "!@#$%^&*()-_=+[]{}|;:,.<>?/~",    # 30 common special / punctuation chars
+    # The four printable ASCII chars not covered by the line above — each
+    # embedded mid-word so that sXY / @X / oNX rules targeting them are
+    # distinguishable from no-ops and from each other:
+    "a`b",    # backtick  (0x60)
+    'a"b',    # double-quote (0x22)
+    "a'b",    # single-quote / apostrophe (0x27)
+    "a\\b",   # backslash (0x5C)
+    "a b",    # space (0x20) — completes full 95-char printable ASCII coverage
     # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
     "Password",
     "AdminUser",
@@ -1226,7 +1237,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog='minimizer',
         description=(
-            'Standalone Hashcat Rule Minimizer (v1.3)\n\n'
+            'Standalone Hashcat Rule Minimizer (v1.4)\n\n'
             'Eliminates functionally redundant rules by computing each rule\'s\n'
             'signature — the tuple of outputs on a fixed probe set of words.\n\n'
             'Rules with identical signatures produce identical output on every\n'
