@@ -13,6 +13,13 @@ ranking) and the later duplicate is discarded.
 
 Changelog
 ---------
+v1.3 — new feature
+  * New: --debug-file FILE traces every rule in FILE against the probe set
+    and exits.  Designed for bulk inspection of rules from comm/diff output
+    (e.g. the dropped_rules.txt produced by comm -23).  Blank lines and
+    #-comment lines are skipped; output is identical to running --debug-rule
+    for each rule in sequence, with a separator every 10 rules.
+
 v1.2 — bug fixes
   * Fix: probe set extended with three "alphabet" words covering all 95
     printable ASCII code-points.  Before this fix, rules like @j / @x / @z
@@ -24,15 +31,14 @@ v1.2 — bug fixes
   * Fix: probe set extended to length-36 words so that rules targeting
     positions B(11)–Z(35) — e.g. 'B–'Z, TB–TZ, DB–DZ, LB–LZ, etc. —
     get distinct signatures instead of collapsing into the same no-op
-    bucket and being falsely eliminated.  This was the main cause of
-    lost cracks with rulesets that use high-position opcodes.
+    bucket and being falsely eliminated.
   * Fix: opcode E now uses only ASCII space (0x20) as the word separator,
     matching hashcat's documented behaviour.  Previously hyphen (0x2D)
-    and underscore (0x5F) were also treated as separators, producing
-    wrong signatures for words like "my-password" or "my_password".
-  * Fix: read_rules() now strips inline comments (trailing " # ...") so
-    that rules annotated with comments are parsed and compared correctly
-    instead of being given unsupported-opcode signatures.
+    and underscore (0x5F) were also treated as separators.
+  * Note: an earlier draft of v1.2 incorrectly stripped mid-line '#' as
+    inline comments.  This has been reverted — '#' is a valid hashcat
+    argument character (e.g. i3#, iB#) and hashcat does not support
+    inline comments in rule files.
 
 Usage
 -----
@@ -882,19 +888,19 @@ def read_rules(path: str) -> List[str]:
     """
     Read *path* and return all non-blank, non-comment lines.
 
-    Comment lines start with '#'.  Inline comments (trailing ' # ...')
-    are stripped so that rules like ``l r # note`` are correctly parsed
-    as ``l r``.  Both Windows (\\r\\n) and Unix (\\n) line endings are
-    handled.
+    Comment lines start with '#'.  Both Windows (\\r\\n) and Unix (\\n)
+    line endings are handled.
+
+    NOTE: '#' mid-line is NOT treated as an inline comment because '#' is a
+    valid hashcat argument character (e.g. ``i3#`` inserts '#' at position 3).
+    Hashcat itself does not support inline comments, so every non-blank line
+    that doesn't start with '#' is kept verbatim.
     """
     rules: List[str] = []
     try:
         with open(path, encoding='utf-8', errors='ignore') as fh:
             for line in fh:
                 r = line.rstrip('\r\n')
-                # Strip inline comments: first '#' not at position 0
-                if '#' in r and not r.startswith('#'):
-                    r = r[:r.index('#')].rstrip()
                 if r and not r.startswith('#'):
                     rules.append(r)
     except FileNotFoundError:
@@ -1220,7 +1226,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog='minimizer',
         description=(
-            'Standalone Hashcat Rule Minimizer (v1.2)\n\n'
+            'Standalone Hashcat Rule Minimizer (v1.3)\n\n'
             'Eliminates functionally redundant rules by computing each rule\'s\n'
             'signature — the tuple of outputs on a fixed probe set of words.\n\n'
             'Rules with identical signatures produce identical output on every\n'
@@ -1287,6 +1293,13 @@ def main() -> None:
                           'Trace a single rule against the probe set and exit.  '
                           'Shows the transformation applied to each probe word.  '
                           'Example: --debug-rule "l r $1"'))
+    grp3.add_argument('--debug-file', metavar='FILE', default=None,
+                      help=(
+                          'Trace every rule in FILE against the probe set and exit.  '
+                          'FILE must contain one rule per line (same format as a rule '
+                          'file; blank lines and # comment lines are skipped).  '
+                          'Useful to bulk-inspect rules from comm / diff output.  '
+                          'Example: --debug-file dropped_rules.txt'))
 
     args = ap.parse_args()
 
@@ -1391,6 +1404,25 @@ def main() -> None:
     # ── --debug-rule: trace one rule and exit ─────────────────────────
     if args.debug_rule is not None:
         debug_rule(args.debug_rule, probe)
+        sys.exit(0)
+
+    # ── --debug-file: trace every rule in a file and exit ─────────────
+    if args.debug_file is not None:
+        try:
+            batch = read_rules(args.debug_file)
+        except SystemExit:
+            sys.exit(1)
+        if not batch:
+            print(red(f"[ERROR] No rules found in {args.debug_file}"), file=sys.stderr)
+            sys.exit(1)
+        print(f"\n{bold(cyan('[DEBUG-FILE]'))}  {len(batch)} rule(s) loaded from "
+              f"{bold(args.debug_file)}\n")
+        for idx, rule in enumerate(batch, 1):
+            print(f"{dim(f'  [{idx}/{len(batch)}]')}  {bold(repr(rule))}")
+            debug_rule(rule, probe)
+            # separator every 10 rules to keep long outputs readable
+            if idx % 10 == 0 and idx < len(batch):
+                print(dim("  " + "─" * 60))
         sys.exit(0)
     print(f"[PRB]  Probe set: {bold(str(len(probe)))} words")
     if len(probe) <= 40:
