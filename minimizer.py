@@ -1335,11 +1335,11 @@ def main() -> None:
             ("typical password base words  (len 7–9)",               slice(8, 16)),
             ("longer words  (len 10–11, truncation / repeat ops)",   slice(16, 21)),
             ("extended-length words  (len 12–36, positions B–Z)",    slice(21, 30)),
-            ("alphabet coverage  (all printable ASCII chars)",       slice(30, 33)),
-            ("mixed-case  (l/u/c/C/t/E/T/k/K)",                     slice(33, 37)),
-            ("words with digits  (s o @ T)",                         slice(37, 41)),
-            ("special chars  (@ removal, s substitution)",           slice(41, 43)),
-            ("repeated chars  (q doubling, z/Z extend)",             slice(43, 45)),
+            ("alphabet coverage  (all 95 printable ASCII chars)",    slice(30, 38)),
+            ("mixed-case  (l/u/c/C/t/E/T/k/K)",                     slice(38, 42)),
+            ("words with digits  (s o @ T)",                         slice(42, 46)),
+            ("special chars  (@ removal, s substitution)",           slice(46, 48)),
+            ("repeated chars  (q doubling, z/Z extend)",             slice(48, 50)),
         ]
         for label, sl in _categories:
             words = BUILTIN_PROBES[sl]
