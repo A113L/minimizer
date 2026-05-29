@@ -38,7 +38,7 @@ pip install tqdm
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/minimizer.git
+git clone https://github.com/A113L/minimizer.git
 cd minimizer
 ```
 
