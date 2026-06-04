@@ -166,7 +166,7 @@ def dbg(msg: str, *, level: str = "DBG") -> None:
         print(f"{tag} {msg}", file=_DEBUG_FILE)
 
 
-def debug_rule(rule: str, probe: List[str]) -> None:
+def debug_rule(rule: str, probe: List[str], multibyte: bool = False) -> None:
     """
     Trace *rule* applied to every word in *probe* and print the results.
     Used by --debug-rule to inspect what a specific rule does.
@@ -177,7 +177,7 @@ def debug_rule(rule: str, probe: List[str]) -> None:
     any_unsupported  = False
     any_invalid_utf8 = False
     for word in probe:
-        result = apply_chain(rule, word)
+        result = apply_chain(rule, word, multibyte=multibyte)
         if result is None:
             tag = yellow("→  <unsupported>")
             any_unsupported = True
@@ -489,10 +489,11 @@ def _apply_single(
                  (c & ~0x20 if 97 <= c <= 122 else c) for c in w]
         elif cmd == 'E':
             # Title-case: lowercase everything, then uppercase the first letter
-            # and every letter that immediately follows a space (32), hyphen (45)
-            # or underscore (95).
+            # and every letter that immediately follows a space (0x20).
+            # Hashcat v1.2 fix: only ASCII space is a word separator for E —
+            # hyphen and underscore are NOT separators (hashcat-compatible behaviour).
             # wiki example: "p@ssW0rd w0rld" → "P@ssw0rd W0rld"
-            # The 'W' in W0rd must become 'w' — so we must also lowercase uppercase
+            # The 'W' in W0rd must become 'w' — so we also lowercase uppercase
             # letters that are NOT at a word-start position.
             out = []
             cap = True
@@ -590,7 +591,10 @@ def _apply_single(
 
         # ── two-char argument ops (len >= 3) ─────────────────────────
         elif cmd == 's' and len(rule) >= 3:
-            a, b = _arg_ord(rule, 1), _arg_ord(rule, 2 if rule[1] != '\\' else 5)
+            # Use _read_arg_char to correctly advance past \xNN escapes
+            arg1_str, pos2 = _read_arg_char(rule, 1)
+            a = _arg_ord(rule, 1)
+            b = _arg_ord(rule, pos2)
             w = [b if c == a else c for c in w]
         elif cmd == 'i' and len(rule) >= 3:
             p, ch = dg(rule[1]), _arg_ord(rule, 2)
@@ -780,7 +784,11 @@ def apply_chain(
 # ====================================================================
 # --- SIGNATURE COMPUTATION ---
 # ====================================================================
-_UNSUPPORTED_SIG: tuple = ('__UNSUPPORTED__',)
+# Sentinel PREFIX — the actual per-rule sentinel is ('__UNSUPPORTED__', rule_text).
+# Using a 2-tuple ensures two different unsupported rules never share a signature.
+# The old form ('__UNSUPPORTED__',) caused all unsupported rules to collapse into
+# one bucket; this string constant is kept only as a readable reference.
+_UNSUPPORTED_SIG_PREFIX: str = '__UNSUPPORTED__'
 
 
 def compute_signature(
@@ -942,12 +950,11 @@ def _sig_worker(args: tuple) -> List[tuple]:
 
     Returns
     -------
-    list of (rule: str, sig_blob: bytes)
-        ``sig_blob`` is ``pickle.dumps(signature, protocol=4)``.
-        Returning bytes instead of the raw tuple avoids re-pickling
-        complex ``InvalidUTF8Bytes`` objects across the IPC boundary a
-        second time — each worker serialises once, the main process
-        uses the blob directly as a dict key.
+    list of (rule: str, sig_key: str)
+        ``sig_key`` is the SHA-256 hex digest of ``pickle.dumps(signature, protocol=4)``.
+        Returning a fixed-length hex string (not the raw pickle blob) means the
+        SQLite PRIMARY KEY column gets a proper B-tree-indexed TEXT value rather
+        than an unindexable BLOB — fast lookups even on 10M+ rule sets.
     """
     rules_slice, probe, multibyte = args
     out = []
@@ -1046,8 +1053,8 @@ def _minimizer_sqlite(
         pending = 0
         conn.execute("BEGIN")
 
-        for rule, sig_blob in iterator:
-            cur.execute("INSERT OR IGNORE INTO sigs (sig) VALUES (?)", (sig_blob,))
+        for rule, sig_key in iterator:
+            cur.execute("INSERT OR IGNORE INTO sigs (sig) VALUES (?)", (sig_key,))
             if cur.rowcount:
                 kept.append(rule)
                 dbg(f"KEPT  [{len(kept):>6,}]  {rule!r}", level="RULE")
@@ -1415,7 +1422,7 @@ def main() -> None:
 
     # ── --debug-rule: trace one rule and exit ─────────────────────────
     if args.debug_rule is not None:
-        debug_rule(args.debug_rule, probe)
+        debug_rule(args.debug_rule, probe, multibyte=args.multibyte)
         sys.exit(0)
 
     # ── --debug-file: trace every rule in a file and exit ─────────────
@@ -1431,7 +1438,7 @@ def main() -> None:
               f"{bold(args.debug_file)}\n")
         for idx, rule in enumerate(batch, 1):
             print(f"{dim(f'  [{idx}/{len(batch)}]')}  {bold(repr(rule))}")
-            debug_rule(rule, probe)
+            debug_rule(rule, probe, multibyte=args.multibyte)
             # separator every 10 rules to keep long outputs readable
             if idx % 10 == 0 and idx < len(batch):
                 print(dim("  " + "─" * 60))
