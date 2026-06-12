@@ -464,6 +464,15 @@ def _apply_single(
         if 'A' <= c <= 'Z': return ord(c) - 55   # A=10, B=11, …, Z=35
         return -1
 
+    def parg(chain: str, pos: int) -> Tuple[int, int]:
+        """Read a position/count argument (handles \\xNN escapes), return (dg-value, new_pos)."""
+        s, np = _read_arg_char(chain, pos)
+        if s.startswith('\\x') and len(s) == 4:
+            ch = chr(int(s[2:], 16))
+        else:
+            ch = s
+        return dg(ch), np
+
     dbg(f"  atom={rule!r}  word_before={word!r}", level="DBG")
 
     try:
@@ -542,51 +551,50 @@ def _apply_single(
             ch = _arg_ord(rule, 1)
             w  = [c for c in w if c != ch]
         elif cmd == 'p' and len(rule) >= 2:
-            n = dg(rule[1])
+            n, _ = parg(rule, 1)
             if n > 0:
                 orig = w[:]
                 for _ in range(n): w += orig
         elif cmd == 'T' and len(rule) >= 2:
-            p = dg(rule[1])
+            p, _ = parg(rule, 1)
             if 0 <= p < len(w):
                 c = w[p]
                 w[p] = (c | 0x20 if 65 <= c <= 90
                         else (c & ~0x20 if 97 <= c <= 122 else c))
         elif cmd == 'D' and len(rule) >= 2:
-            p = dg(rule[1])
+            p, _ = parg(rule, 1)
             if 0 <= p < len(w): w.pop(p)
         elif cmd == 'L' and len(rule) >= 2:
-            p = dg(rule[1])
+            p, _ = parg(rule, 1)
             if 0 <= p < len(w): w[p] = (w[p] << 1) & 0xFF
         elif cmd == 'R' and len(rule) >= 2:
-            p = dg(rule[1])
+            p, _ = parg(rule, 1)
             if 0 <= p < len(w): w[p] = (w[p] >> 1) & 0xFF
         elif cmd == '+' and len(rule) >= 2:
-            p = dg(rule[1])
+            p, _ = parg(rule, 1)
             if 0 <= p < len(w): w[p] = (w[p] + 1) & 0xFF
         elif cmd == '-' and len(rule) >= 2:
-            p = dg(rule[1])
+            p, _ = parg(rule, 1)
             if 0 <= p < len(w): w[p] = (w[p] - 1) & 0xFF
         elif cmd in ('.', ',') and len(rule) >= 2:
-            p     = dg(rule[1])
+            p, _ = parg(rule, 1)
             delta = 1 if cmd == '.' else -1
             if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
         elif cmd == "'" and len(rule) >= 2:
             # 'N — truncate: keep only the first N characters (w[:N])
             # wiki example: '6 on "p@ssW0rd" → "p@ssW0" (6 chars, indices 0-5)
-            p = dg(rule[1])
-            if 0 <= p: w = w[:p]
+            p, _ = parg(rule, 1)
         elif cmd == 'z' and len(rule) >= 2:
-            n = dg(rule[1])
+            n, _ = parg(rule, 1)
             if n > 0 and w: w = [w[0]] * n + w
         elif cmd == 'Z' and len(rule) >= 2:
-            n = dg(rule[1])
+            n, _ = parg(rule, 1)
             if n > 0 and w: w = w + [w[-1]] * n
         elif cmd == 'y' and len(rule) >= 2:
-            n = dg(rule[1])
+            n, _ = parg(rule, 1)
             if n > 0: w = w[:n] + w
         elif cmd == 'Y' and len(rule) >= 2:
-            n = dg(rule[1])
+            n, _ = parg(rule, 1)
             if n > 0 and len(w) >= n: w = w + w[-n:]
 
         # ── two-char argument ops (len >= 3) ─────────────────────────
@@ -597,10 +605,12 @@ def _apply_single(
             b = _arg_ord(rule, pos2)
             w = [b if c == a else c for c in w]
         elif cmd == 'i' and len(rule) >= 3:
-            p, ch = dg(rule[1]), _arg_ord(rule, 2)
+            p, pos2 = parg(rule, 1)
+            ch = _arg_ord(rule, pos2)
             if 0 <= p <= len(w): w.insert(p, ch)
         elif cmd == 'o' and len(rule) >= 3:
-            p, ch = dg(rule[1]), _arg_ord(rule, 2)
+            p, pos2 = parg(rule, 1)
+            ch = _arg_ord(rule, pos2)
             if 0 <= p < len(w): w[p] = ch
         elif cmd == 'e' and len(rule) >= 2:
             # Title-case with custom separator: lowercase everything, then uppercase
@@ -620,14 +630,17 @@ def _apply_single(
         elif cmd == 'x' and len(rule) >= 3:
             # xNM — extract M characters starting at position N
             # hashcat semantics: w = w[N : N+M]  (M is a count, not an end index)
-            n, m = dg(rule[1]), dg(rule[2])
+            n, pos2 = parg(rule, 1)
+            m, _ = parg(rule, pos2)
             if n >= 0 and m >= 0:
                 w = w[n:n + m]
         elif cmd == 'O' and len(rule) >= 3:
-            p, m = dg(rule[1]), dg(rule[2])
+            p, pos2 = parg(rule, 1)
+            m, _ = parg(rule, pos2)
             if 0 <= p < len(w) and m > 0: w = w[:p] + w[p + m:]
         elif cmd == '*' and len(rule) >= 3:
-            a, b = dg(rule[1]), dg(rule[2])
+            a, pos2 = parg(rule, 1)
+            b, _ = parg(rule, pos2)
             if 0 <= a < len(w) and 0 <= b < len(w) and a != b:
                 w[a], w[b] = w[b], w[a]
         elif cmd == '3' and len(rule) >= 3:
@@ -637,7 +650,8 @@ def _apply_single(
             # (first separator) would require cnt==0 AFTER incrementing (impossible).
             # Fix: compare cnt == n after incrementing — but n is 0-based so we
             # compare cnt == n+1, i.e. match on the (n+1)th time we see the separator.
-            n, sep = dg(rule[1]), _arg_ord(rule, 2)
+            n, pos2 = parg(rule, 1)
+            sep = _arg_ord(rule, pos2)
             cnt = 0
             for i, c in enumerate(w):
                 if c == sep:
@@ -1011,14 +1025,12 @@ def _minimizer_sqlite(
 
         kept: List[str] = []
         n_removed       = 0
-        _BATCH          = 10_000
 
         # ── parallel signature computation ────────────────────────────
         pairs: List[tuple] = _compute_sigs_parallel(rules, probe, multibyte, workers)
 
         # ── serial deduplication INSERT ───────────────────────────────
         _BATCH    = 10_000
-        _interval = max(1, len(pairs) // 100)   # ~100 updates regardless of size
 
         if HAS_TQDM:
             iterator = tqdm(
