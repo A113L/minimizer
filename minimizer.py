@@ -67,11 +67,10 @@ import datetime
 import hashlib
 import multiprocessing
 import os
-import pickle
 import random
-import sqlite3
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
 from typing import List, Optional, Tuple, Union
 
 try:
@@ -944,269 +943,326 @@ def read_rules(path: str) -> List[str]:
 
 
 # ====================================================================
-# --- MULTIPROCESSING WORKER ---
+# --- PROGRESSIVE SIGNATURE MINIMIZER ---
 # ====================================================================
 
-def _sig_worker(args: tuple) -> List[tuple]:
-    """
-    Top-level worker function for multiprocessing.
-
-    Must be defined at module level (not a closure) so that
-    ``ProcessPoolExecutor`` can pickle it on all platforms (including
-    Windows / macOS which use the *spawn* start method).
-
-    Parameters
-    ----------
-    args : (rules_slice, probe, multibyte)
-        rules_slice : list of str  — the chunk of rules to process
-        probe       : list of str  — probe word set
-        multibyte   : bool
-
-    Returns
-    -------
-    list of (rule: str, sig_key: str)
-        ``sig_key`` is the SHA-256 hex digest of ``pickle.dumps(signature, protocol=4)``.
-        Returning a fixed-length hex string (not the raw pickle blob) means the
-        SQLite PRIMARY KEY column gets a proper B-tree-indexed TEXT value rather
-        than an unindexable BLOB — fast lookups even on 10M+ rule sets.
-    """
-    rules_slice, probe, multibyte = args
-    out = []
-    for rule in rules_slice:
-        sig      = compute_signature(rule, probe, multibyte=multibyte)
-        sig_blob = pickle.dumps(sig, protocol=4)
-        # Use a fixed-length SHA-256 hex digest as the dedup key.
-        # A raw pickle blob as SQLite PRIMARY KEY is not indexable (BLOB type
-        # forces a full-scan on every INSERT OR IGNORE).  A 64-char TEXT hash
-        # gets a proper B-tree index → fast lookups even on 10M+ rule sets.
-        sig_key  = hashlib.sha256(sig_blob).hexdigest()
-        out.append((rule, sig_key))
-    return out
+# Keep the same progressive strategy used by RULEST: an early, diverse probe
+# batch separates most rules; only colliding signatures are refined with later
+# probes. The complete probe set is still evaluated for every unresolved
+# collision, so the equivalence relation is unchanged.
+MINIMIZER_PROBE_BATCH_SIZE = 8
+MINIMIZER_BATCH_SIZE = 25_000
+_MINIMIZER_UNSUPPORTED_PREFIX = "__UNSUPPORTED__::"
+_MINIMIZER_PRIORITY_PROBES = (
+    "abcdefghijklmnopqrstuvwxyz",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "!@#$%^&*()-_=+[]{}|;:,.<>?/~",
+    "averylongpassword1234567890abcdefghi",
+    "qwertyuiopasdfgh",
+    "a b",
+    "Password",
+    "p@ssw0rd",
+    "correcthorsebattery",
+    "averylongpassword1234567890abcdef",
+    "superman123",
+    "test1234",
+)
+_MINIMIZER_UNSUPPORTED_KIND = 1
+_MINIMIZER_SUPPORTED_KIND = 0
 
 
-# ====================================================================
-# --- CORE MINIMIZER ---
-# ====================================================================
+def _minimizer_record_dtype(rule_count: int):
+    index_dtype = "<u4" if rule_count <= 0xFFFFFFFF else "<u8"
+    return np.dtype([("kind", "u1"), ("sig", "V16"), ("idx", index_dtype)])
 
 
-def _minimizer_sqlite(
-    rules: List[str],
-    probe: List[str],
+_MINIMIZER_WORKER_PROBES: List[str] = []
+_MINIMIZER_WORKER_MULTIBYTE = False
+
+
+def _minimizer_worker_init(probe_words: List[str], multibyte: bool) -> None:
+    """Initialize immutable probe state once in each worker process."""
+    global _MINIMIZER_WORKER_PROBES, _MINIMIZER_WORKER_MULTIBYTE
+    _MINIMIZER_WORKER_PROBES = probe_words
+    _MINIMIZER_WORKER_MULTIBYTE = bool(multibyte)
+
+
+def _ordered_minimizer_probes(probe_words: List[str]) -> List[str]:
+    """Prioritize diverse built-in probes without dropping/replacing any."""
+    remaining = list(probe_words)
+    ordered: List[str] = []
+    for preferred in _MINIMIZER_PRIORITY_PROBES:
+        try:
+            index = remaining.index(preferred)
+        except ValueError:
+            continue
+        ordered.append(remaining.pop(index))
+    ordered.extend(remaining)
+    return ordered
+
+
+def _minimizer_probe_ranges(probe_count: int):
+    batch_size = max(1, int(MINIMIZER_PROBE_BATCH_SIZE))
+    if probe_count <= 0:
+        return [(0, 0)]
+    return [
+        (start, min(probe_count, start + batch_size))
+        for start in range(0, probe_count, batch_size)
+    ]
+
+
+def _minimizer_unsupported_signature(rule: str) -> bytes:
+    # The separate kind byte prevents unsupported rules from ever colliding
+    # with supported output signatures. Exact text is checked if hashes tie.
+    return hashlib.blake2b(
+        rule.encode("utf-8", errors="surrogatepass"), digest_size=16
+    ).digest()
+
+
+def _minimizer_probe_chunk_signature_raw(
+    rule: str, probe_words: List[str], start: int, stop: int,
     multibyte: bool = False,
-    workers: int = 1,
-) -> "tuple[List[str], int, int]":
-    """
-    SQLite-backed deduplication — used for all rulesets regardless of size.
+):
+    """Return a compact (16-byte signature, kind) pair."""
+    atoms = tokenize_rule(rule)
+    digest = hashlib.blake2b(digest_size=16)
+    for word in probe_words[start:stop]:
+        current: Union[str, InvalidUTF8Bytes, None] = word
+        for atom in atoms:
+            current = _apply_single(atom, current, multibyte=multibyte)  # type: ignore[arg-type]
+            if current is None:
+                return _minimizer_unsupported_signature(rule), _MINIMIZER_UNSUPPORTED_KIND
+        if isinstance(current, InvalidUTF8Bytes):
+            kind = b"\x01"
+            encoded = current.raw
+        else:
+            kind = b"\x00"
+            encoded = current.encode("utf-8", errors="surrogatepass")
+        digest.update(kind)
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.digest(), _MINIMIZER_SUPPORTED_KIND
 
-    The signature map lives entirely inside a temporary ``minimizer_tmp_<pid>.db``
-    file in the current working directory, which is deleted unconditionally on
-    completion (success or error).  Only the ``kept`` list (unique rules) is
-    held in Python memory.
 
-    When *workers* > 1 the signature-computation phase is parallelised across
-    a ``ProcessPoolExecutor``.  The deduplication INSERT loop always runs on
-    the main process (SQLite connections are not fork-safe).
-    """
-    db_path = os.path.join(os.getcwd(), f"minimizer_tmp_{os.getpid()}.db")
-    if os.path.exists(db_path):
-        os.remove(db_path)
+def _minimizer_probe_chunk_signature(
+    rule: str, probe_words: List[str], start: int, stop: int,
+    multibyte: bool = False,
+) -> str:
+    """Backward-compatible textual representation for diagnostic callers."""
+    signature, kind = _minimizer_probe_chunk_signature_raw(
+        rule, probe_words, start, stop, multibyte=multibyte
+    )
+    if kind == _MINIMIZER_UNSUPPORTED_KIND:
+        return _MINIMIZER_UNSUPPORTED_PREFIX + rule
+    return signature.hex()
 
-    conn = sqlite3.connect(db_path)
+
+def _extend_minimizer_signature_raw(previous, previous_kind, chunk_signature, chunk_kind):
+    if previous_kind == _MINIMIZER_UNSUPPORTED_KIND or chunk_kind == _MINIMIZER_UNSUPPORTED_KIND:
+        if chunk_kind == _MINIMIZER_UNSUPPORTED_KIND:
+            return chunk_signature, _MINIMIZER_UNSUPPORTED_KIND
+        return previous, previous_kind
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(previous)
+    digest.update(chunk_signature)
+    return digest.digest(), _MINIMIZER_SUPPORTED_KIND
+
+
+def _extend_minimizer_signature(previous: str, chunk_signature: str) -> str:
+    """Backward-compatible textual signature extension."""
+    if previous.startswith(_MINIMIZER_UNSUPPORTED_PREFIX):
+        return previous
+    if chunk_signature.startswith(_MINIMIZER_UNSUPPORTED_PREFIX):
+        return chunk_signature
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(bytes.fromhex(previous))
+    digest.update(bytes.fromhex(chunk_signature))
+    return digest.hexdigest()
+
+
+def _minimizer_initial_worker(task):
+    index, rule, start, stop = task
+    signature, kind = _minimizer_probe_chunk_signature_raw(
+        rule, _MINIMIZER_WORKER_PROBES, start, stop,
+        multibyte=_MINIMIZER_WORKER_MULTIBYTE,
+    )
+    return int(index), signature, kind
+
+
+def _minimizer_refine_worker(task):
+    slot, rule, previous, previous_kind, start, stop = task
+    chunk_signature, chunk_kind = _minimizer_probe_chunk_signature_raw(
+        rule, _MINIMIZER_WORKER_PROBES, start, stop,
+        multibyte=_MINIMIZER_WORKER_MULTIBYTE,
+    )
+    signature, kind = _extend_minimizer_signature_raw(
+        previous, previous_kind, chunk_signature, chunk_kind
+    )
+    return int(slot), signature, kind
+
+
+def _minimizer_map(executor, function, tasks):
+    if executor is None:
+        return map(function, tasks)
+    return executor.map(function, tasks, chunksize=128)
+
+
+def _minimizer_progress(total: int, description: str):
+    if HAS_TQDM:
+        return tqdm(
+            total=max(0, int(total)),
+            desc=green(description),
+            unit="rule",
+            mininterval=0.5,
+        )
+    return None
+
+
+def _minimizer_classify_and_compact(records, active_count: int, keep_mask):
+    """Mark singleton source offsets and compact collision records in-place."""
+    if active_count <= 0:
+        return 0
+    active = records[:active_count]
+    active.sort(order=("kind", "sig", "idx"), kind="quicksort")
+    if active_count == 1:
+        keep_mask[int(active["idx"][0])] = True
+        return 0
+
+    same = (active["kind"][1:] == active["kind"][:-1]) & (
+        active["sig"][1:] == active["sig"][:-1]
+    )
+    if not np.any(same):
+        keep_mask[active["idx"]] = True
+        return 0
+
+    collision_mask = np.zeros(active_count, dtype=np.bool_)
+    collision_mask[:-1] |= same
+    collision_mask[1:] |= same
+    collision_count = int(np.count_nonzero(collision_mask))
+    if collision_count * 2 < active_count:
+        keep_mask[active["idx"]] = True
+        collision_offsets = active["idx"][collision_mask]
+        keep_mask[collision_offsets] = False
+    else:
+        single_offsets = active["idx"][~collision_mask]
+        keep_mask[single_offsets] = True
+    if collision_count:
+        np.compress(collision_mask, active, axis=0, out=active[:collision_count])
+    return collision_count
+
+
+def _minimizer_resolve_final(records, active_count: int, rules: List[str], keep_mask):
+    """Keep the earliest input rule from each final signature group."""
+    if active_count <= 0:
+        return
+    active = records[:active_count]
+    active.sort(order=("kind", "sig", "idx"), kind="quicksort")
+    pos = 0
+    while pos < active_count:
+        kind = int(active["kind"][pos])
+        signature = active["sig"][pos]
+        end = pos + 1
+        while end < active_count and int(active["kind"][end]) == kind and active["sig"][end] == signature:
+            end += 1
+        if kind == _MINIMIZER_UNSUPPORTED_KIND:
+            # Use the hash to locate possible duplicates, then compare exact
+            # text: distinct unsupported rules must always survive.
+            seen_rules = set()
+            for cursor in range(pos, end):
+                index = int(active["idx"][cursor])
+                rule = rules[index]
+                if rule not in seen_rules:
+                    seen_rules.add(rule)
+                    keep_mask[index] = True
+        else:
+            # idx is the final sort field, so the first item is earliest.
+            keep_mask[int(active["idx"][pos])] = True
+        pos = end
+
+
+def _minimizer_in_memory(
+    rules: List[str], probe: List[str], multibyte: bool, executor=None,
+) -> Tuple[List[str], int, int]:
+    """Offset-indexed minimization with a fixed-size signature buffer."""
+    if not rules:
+        return [], 0, 0
+
+    ranges = _minimizer_probe_ranges(len(probe))
+    batch_size = max(1, int(MINIMIZER_BATCH_SIZE))
+    total = len(rules)
+    records = np.empty(total, dtype=_minimizer_record_dtype(total))
+    records["idx"] = np.arange(total, dtype=records.dtype["idx"])
+    keep_mask = np.zeros(total, dtype=np.bool_)
+
+    first_start, first_stop = ranges[0]
+    progress = _minimizer_progress(total, f"  Compute probes {first_start + 1}-{first_stop}")
     try:
-        cur = conn.cursor()
-        cur.executescript("""
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous  = OFF;
-            PRAGMA temp_store   = MEMORY;
-            PRAGMA cache_size   = -65536;
-        """)
-        cur.execute("CREATE TABLE sigs (sig TEXT PRIMARY KEY)")
-        conn.commit()
-
-        kept: List[str] = []
-        n_removed       = 0
-
-        # ── parallel signature computation ────────────────────────────
-        pairs: List[tuple] = _compute_sigs_parallel(rules, probe, multibyte, workers)
-
-        # ── serial deduplication INSERT ───────────────────────────────
-        _BATCH    = 10_000
-
-        if HAS_TQDM:
-            iterator = tqdm(
-                pairs,
-                desc=green("  Deduplicating"),
-                unit="rule",
-                ncols=88,
-                bar_format=(
-                    "{l_bar}{bar}| {n_fmt}/{total_fmt} "
-                    "[{elapsed}<{remaining}] {postfix}"
-                ),
+        for offset in range(0, total, batch_size):
+            stop_at = min(total, offset + batch_size)
+            tasks = (
+                (index, rules[index], first_start, first_stop)
+                for index in range(offset, stop_at)
             )
-            set_postfix = iterator.set_postfix
-        else:
-            _counter = [0]
-            def _noop_postfix(**_kw): pass
-            def _simple_iter(pairs):
-                total = len(pairs)
-                for p in pairs:
-                    _counter[0] += 1
-                    if _counter[0] % _interval == 0 or _counter[0] == total:
-                        pct = _counter[0] / total * 100
-                        print(
-                            f"  dedup  {_counter[0]:,}/{total:,}  ({pct:.0f}%)  "
-                            f"kept={len(kept):,}",
-                            end="\r", flush=True,
-                        )
-                    yield p
-            iterator    = _simple_iter(pairs)
-            set_postfix = _noop_postfix
-
-        pending = 0
-        conn.execute("BEGIN")
-
-        for rule, sig_key in iterator:
-            cur.execute("INSERT OR IGNORE INTO sigs (sig) VALUES (?)", (sig_key,))
-            if cur.rowcount:
-                kept.append(rule)
-                dbg(f"KEPT  [{len(kept):>6,}]  {rule!r}", level="RULE")
-                if HAS_TQDM:
-                    set_postfix({"unique": cyan(str(len(kept)))}, refresh=False)
-            else:
-                n_removed += 1
-                dbg(f"DROP  rule={rule!r}", level="DUP")
-
-            pending += 1
-            if pending >= _BATCH:
-                conn.commit()
-                conn.execute("BEGIN")
-                pending = 0
-
-        conn.commit()
-
-        if not HAS_TQDM:
-            print()
-
+            for index, signature, kind in _minimizer_map(
+                    executor, _minimizer_initial_worker, tasks):
+                records["sig"][index] = signature
+                records["kind"][index] = kind
+            if progress is not None:
+                progress.update(stop_at - offset)
     finally:
-        conn.close()
-        if os.path.exists(db_path):
-            os.remove(db_path)
-            print(f"  {dim('[DB]  Temporary database removed.')}")
+        if progress is not None:
+            progress.close()
 
-    return kept, len(kept), n_removed
+    active_count = _minimizer_classify_and_compact(records, total, keep_mask)
+    if active_count == 0:
+        return rules, len(rules), 0
 
+    for pass_number, (start, stop) in enumerate(ranges[1:], start=2):
+        if active_count == 0:
+            break
+        progress = _minimizer_progress(
+            active_count, f"  Refine probes {start + 1}-{stop}"
+        )
+        processed = 0
+        try:
+            for offset in range(0, active_count, batch_size):
+                stop_at = min(active_count, offset + batch_size)
 
-def _compute_sigs_parallel(
-    rules: List[str],
-    probe: List[str],
-    multibyte: bool,
-    workers: int,
-) -> List[tuple]:
-    """
-    Compute ``(rule, sig_blob)`` pairs for every rule in *rules*.
+                def tasks_for_batch():
+                    for slot in range(offset, stop_at):
+                        index = int(records["idx"][slot])
+                        yield (
+                            slot,
+                            rules[index],
+                            bytes(records["sig"][slot]),
+                            int(records["kind"][slot]),
+                            start,
+                            stop,
+                        )
 
-    When *workers* == 1 the computation runs in the calling process.
-    Otherwise a ``ProcessPoolExecutor`` distributes chunks across *workers* processes.
+                for slot, signature, kind in _minimizer_map(
+                        executor, _minimizer_refine_worker, tasks_for_batch()):
+                    records["sig"][slot] = signature
+                    records["kind"][slot] = kind
+                processed += stop_at - offset
+                if progress is not None:
+                    progress.update(stop_at - offset)
+        finally:
+            if progress is not None:
+                progress.close()
 
-    The returned list preserves the original rule order so that the
-    deduplication loop can safely keep the *first* occurrence.
+        active_count = _minimizer_classify_and_compact(records, active_count, keep_mask)
+        print(
+            f"  {dim('[MIN]')} Probe pass {pass_number}/{len(ranges)}: "
+            f"refined={processed:,}, unresolved={active_count:,}"
+        )
 
-    Chunk sizing
-    ------------
-    ``chunk_size = max(500, len(rules) // (workers * 4))``
-
-    Using 4× more chunks than workers gives the pool scheduler room to
-    balance uneven loads (some rules are slower than others) without the
-    per-chunk IPC overhead becoming significant.
-    """
-    use_mp = workers > 1
-
-    if not use_mp:
-        # Single-process path — progress bar on the computation (this is the slow part)
-        result   = []
-        total    = len(rules)
-        interval = max(1, total // 100)   # ~100 updates regardless of ruleset size
-
-        if HAS_TQDM:
-            iterator = tqdm(
-                rules,
-                desc=green("  Computing"),
-                unit="rule",
-                ncols=88,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
-            )
-        else:
-            _counter = [0]
-            def _simple_iter(rules):
-                for r in rules:
-                    _counter[0] += 1
-                    n = _counter[0]
-                    if n % interval == 0 or n == total:
-                        pct = n / total * 100
-                        print(f"  compute  {n:,}/{total:,}  ({pct:.0f}%)",
-                              end='\r', flush=True)
-                    yield r
-            iterator = _simple_iter(rules)
-
-        for rule in iterator:
-            sig      = compute_signature(rule, probe, multibyte=multibyte)
-            sig_blob = pickle.dumps(sig, protocol=4)
-            sig_key  = hashlib.sha256(sig_blob).hexdigest()
-            result.append((rule, sig_key))
-
-        if not HAS_TQDM:
-            print()   # newline after \r
-        return result
-
-    # ── parallel path ─────────────────────────────────────────────────
-    chunk_size = max(500, len(rules) // (workers * 4))
-    chunks     = [rules[i:i + chunk_size] for i in range(0, len(rules), chunk_size)]
-    work_items = [(chunk, probe, multibyte) for chunk in chunks]
-
-    print(f"  {cyan('[MP]')}  Parallel signature computation: "
-          f"{bold(str(workers))} workers, "
-          f"{bold(str(len(chunks)))} chunks "
-          f"(~{chunk_size:,} rules each)")
-
-    # Collect futures in submission order so we can reconstruct the
-    # original rule sequence after all workers finish.
-    ordered_results: List[List[tuple]] = [None] * len(chunks)  # type: ignore
-
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        future_to_idx = {
-            pool.submit(_sig_worker, item): idx
-            for idx, item in enumerate(work_items)
-        }
-
-        if HAS_TQDM:
-            pbar = tqdm(
-                as_completed(future_to_idx),
-                total=len(chunks),
-                desc=green("  Computing"),
-                unit="chunk",
-                ncols=88,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
-            )
-            completed_iter = pbar
-        else:
-            _done = [0]
-            def _plain_iter(it, total_chunks):
-                for f in it:
-                    _done[0] += 1
-                    print(f"  compute  chunk {_done[0]}/{total_chunks}",
-                          end='\r', flush=True)
-                    yield f
-            completed_iter = _plain_iter(as_completed(future_to_idx), len(chunks))
-
-        for future in completed_iter:
-            idx = future_to_idx[future]
-            ordered_results[idx] = future.result()
-
-    # Flatten while preserving original order
-    flat: List[tuple] = []
-    for batch in ordered_results:
-        flat.extend(batch)
-    return flat
+    _minimizer_resolve_final(records, active_count, rules, keep_mask)
+    kept_count = int(np.count_nonzero(keep_mask))
+    if kept_count == total:
+        return rules, kept_count, 0
+    kept = [rule for index, rule in enumerate(rules) if keep_mask[index]]
+    return kept, len(kept), total - len(kept)
 
 
 def minimizer(
@@ -1215,39 +1271,34 @@ def minimizer(
     multibyte: bool = False,
     workers: int = 1,
 ) -> Tuple[List[str], int, int]:
+    """Deduplicate rules with an in-RAM offset buffer (no temporary database).
+
+    Each candidate is represented by a compact signature record and an offset
+    into the caller's original rule list. Only collisions are refined, while
+    surviving rules retain their original input order.
     """
-    Deduplicate *rules* by functional signature over *probe*.
-
-    Always uses a temporary SQLite database for the deduplication index,
-    regardless of ruleset size.  This keeps memory usage flat and avoids
-    the complexity of two separate code paths.
-
-    When two rules share the same signature the one appearing *earlier*
-    in *rules* is kept (file order = priority).
-
-    Parameters
-    ----------
-    rules : list of str
-        Raw rule strings as read from the rule file.
-    probe : list of str
-        Words used to compute each rule's functional signature.
-    multibyte : bool
-        When ``True`` words are processed as UTF-8 bytes so that rules on
-        non-ASCII (Polish, German, CJK, …) passwords are handled correctly.
-    workers : int
-        Number of worker processes for parallel signature computation.
-        ``1`` disables multiprocessing entirely (default).
-
-    Returns
-    -------
-    kept : list of str
-        Surviving rules in their original file order.
-    n_kept : int
-        ``len(kept)``
-    n_removed : int
-        Number of rules eliminated.
-    """
-    return _minimizer_sqlite(rules, probe, multibyte=multibyte, workers=workers)
+    if not rules:
+        return [], 0, 0
+    ordered_probe = _ordered_minimizer_probes(probe)
+    worker_count = max(1, int(workers))
+    _minimizer_worker_init(ordered_probe, multibyte)
+    print(
+        f"  {cyan('[MIN]')}  Strategy: in-memory offsets; "
+        f"compact fixed-width records; probe batch={max(1, int(MINIMIZER_PROBE_BATCH_SIZE))}; "
+        f"workers={worker_count}"
+    )
+    if worker_count > 1:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_minimizer_worker_init,
+            initargs=(ordered_probe, multibyte),
+        ) as executor:
+            return _minimizer_in_memory(
+                rules, ordered_probe, multibyte=multibyte, executor=executor,
+            )
+    return _minimizer_in_memory(
+        rules, ordered_probe, multibyte=multibyte, executor=None,
+    )
 
 
 # ====================================================================
